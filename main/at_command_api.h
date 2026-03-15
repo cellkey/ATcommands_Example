@@ -74,6 +74,7 @@ bool is_modem_init_active(void);
 // TCP task management functions
 int manage_tcp_tasks(void);
 
+
 #ifdef __cplusplus
 }
 #endif
