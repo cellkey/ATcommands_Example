@@ -1,0 +1,62 @@
+# ESP-IDF Build System
+build/
+sdkconfig
+sdkconfig.old
+*.pyc
+__pycache__/
+
+# VS Code - PC-specific settings (exclude, paths vary per machine)
+.vscode/settings.json
+
+# Keep these VS Code files (portable configurations)
+# .vscode/c_cpp_properties.json
+# .vscode/launch.json
+# .vscode/tasks.json
+
+# Python virtual environments
+venv/
+.venv/
+*.egg-info/
+
+# IDE and Editor files
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Backup folders (if you want to exclude them)
+# Backup/
+
+# Dependencies and packages
+dependencies/
+managed_components/
+
+# Flash download tool
+download.config
+
+# Core dumps and debug files
+*.core
+*.dmp
+
+# OS-specific files
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Compiled binaries
+*.bin
+*.elf
+*.map
+
+# Test coverage
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# Documentation build outputs (if using Sphinx/Doxygen)
+docs/_build/
+docs/doxygen/

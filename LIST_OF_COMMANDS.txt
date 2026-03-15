@@ -1,0 +1,54 @@
+
+Sever commands format	 ACK to sever   	Unit request from sever format	   Server respond format	            NOTES
+----------------------------------------------------------------------------------------------------------------------------------
+				
+OPEN102	                6\r\nOPENED\r\n			                                                              active relay 1 for 2 sec
+OPEN202	                6\r\nOPENED\r\n			
+OPEN302	                6\r\nOPENED\r\n			                                                              activate both relays for 2 sec
+				
+KEEPOPEN	        1\r\nB\r\n			                                                             activate relays until KEEPCLOSE command
+KEEPCLOSE	        1\r\nC\r\n			
+				
+		                              15\r\nCHECK_USER:0522784873\r\n\	    APPROVED101	                     Caller id sent to sever for approval-approvedxxx
+		                              15\r\nCHECK_USER:0522784873\r\n\	    REJECT	                         Rejected
+
+
+
+//ring process- modem A7670E
+
+             +CLCC: 1,1,4,0,0,"0522784873",129,""  //RING like  message on RX line - no RING text
+
+
+[27:56:288]  #RING detected..
+[27:56:340] AT+CHUP                  //hang up call immediately.
+[27:56:361] AT+CATR=7;E0            //??????redirect new coming RX , if any, to keep rx buffer with caller id
+[27:56:362]# 0522784873             //debug only - after parsing caller id
+[27:56:374] AT+CIPSEND=1,27         //ready to send CHECK_USER:0522784873
+[27:56:387]
+[27:56:387] NO CARRIER             //due to hang up - ignored
+[27:56:402] OK
+[27:56:404] OK
+[27:56:447] >15                      //debug only
+[27:56:448] CHECK_USER:0522784873  
+[27:56:448]
+[27:56:450] +CIPSEND: 1,27,27
+[27:56:490]
+[27:56:564] +CIPRXGET: 1,1          //buffered RX ready notif.
+[27:56:603]
+[27:56:608] AT+CIPRXGET=2,1,400     //read buffer
+[27:56:610] +CIPRXGET: 2,1,16,0     // read 16 bytes
+[27:56:610] b
+[27:56:611] APPROVED302             //approved message
+[27:56:611]
+[27:56:611]
+[27:56:612] OK
+[27:56:656] #Active command - APPROVED
+[27:56:663] #APPROVED: ActiveRelay=3 - Period= 2..
+[27:56:664] #Activate both relays..
+[27:56:766] AT+CIPSEND=1,11      //send ack to server
+[27:56:768]
+[27:56:771] >6
+[27:56:773] OPENED
+[27:56:775] OK
+[27:56:777] +CIPSEND: 1,11,11
+

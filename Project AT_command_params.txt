@@ -1,0 +1,22 @@
+Project PATH:  C:\Users\Danny\ESP32_projects\ATcommands_Example
+
+# AT command issuing parameters
+
+Command     response   max trial  interval (Sec)      notes
+====================================================================
+AT           OK         \ 5          3                modem active?
+AT+CSQ      +CSQ: xx,xx \ 15         3               while +CSQ: 99,99
+AT+CREG?    +CREG: 0,1/5 \20         3                handled in code already
+
+AT+CGATT?    +CGATT: 1  \ 3          3               if +CGATT:0 issue AT+CGATT=1
+*AT+CGATT=1    OK       \ 3          3
+AT+CGACT=1,1    OK      \ 3          3
+AT+CIPMODE?    +CIPMODE: 0  \1       0              if +CIPMODE: 1 issue AT+CIPMODE=0
+*AT+CIPMODE=0    OK        \1        0
+
+instead of NETCLOSE/NETOPEN: 
+-------------------------------------
+AT+NETOPEN?     +NETOPEN: 1   \ 1     0             if +NETOPEN: 0 issue AT+NETOPEN
+*AT+NETOPEN     +NETOPEN: 0   \ 2     2 
+
+ AT+CIPOPEN=1,"TCP","gates.crea-cell.com",3000  +CIPOPEN: 1,0   \1  if +CIPOPEN: x,xx RE init 

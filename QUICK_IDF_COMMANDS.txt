@@ -1,0 +1,45 @@
+===========================================
+ESP-IDF QUICK COMMAND REFERENCE
+
+IMPORTANT: Always run ". .\init_idf.ps1" first!
+===========================================
+
+1. INITIALIZE ENVIRONMENT (run this first in each new terminal):
+   . .\init_idf.ps1
+
+2. BUILD PROJECT:
+   idf.py build
+
+3. CLEAN BUILD:
+   idf.py fullclean
+
+4. FLASH TO DEVICE (when ready):
+   idf.py flash
+   
+   Or with specific port:
+   idf.py -p COM3 flash
+
+5. MONITOR SERIAL OUTPUT:
+   idf.py monitor
+   
+   Or with specific port:
+   idf.py -p COM3 monitor
+
+6. BUILD + FLASH + MONITOR (all in one):
+   idf.py build flash monitor
+
+7. CONFIGURE PROJECT (menuconfig):
+   idf.py menuconfig
+
+8. CHECK BUILD SIZE:
+   idf.py size
+
+9. ERASE FLASH:
+   idf.py erase-flash
+
+10. SET TARGET (if needed):
+    idf.py set-target esp32c3
+
+===========================================
+IMPORTANT: Always run ". .\init_idf.ps1" first!
+===========================================
