@@ -15,6 +15,7 @@
 #include "a7670e_config.h"      // modem UART mapping (UART/Pin selection)
 #include "a7670e_sequences.h"
 #include "server_keepalive.h"
+#include "digital_input_alert.h"
 #include "relay_control.h"
 #include "ble_gatt_server.h"
 #include "modem_task_control.h"
@@ -1166,6 +1167,11 @@ void app_main(void) {
     /* 2) BLE init (fast); then modem/UART. KA has lowest priority. */
     if (ble_gatt_server_init() != ESP_OK) {
         ESP_LOGE(TAG, "BLE GATT server init failed");
+    }
+
+    /* 3) Digital input monitor: GPIO22 pull-up, active-low; sends ALERT01 after 180s active. */
+    if (!digital_input_alert_task_start()) {
+        ESP_LOGW(TAG, "Digital input alert task not started");
     }
 
     /* Task watchdog: configurable timeout, panic if not fed. Fed by uart_rx_task (modem) and status_led_task (BLE). */
