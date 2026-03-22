@@ -142,17 +142,17 @@ static void modem_status_led_task(void *arg)
         if (!init_active && !connected) {
             /* Idle: LED off */
             gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 0);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(300));
         } else if (init_active && !connected) {
             /* Init / connect phase: solid ON */
             gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 1);
             vTaskDelay(pdMS_TO_TICKS(200));
         } else {
-            /* Connected: blink 500 ms ON, 2500 ms OFF */
+            /* Connected: blink 300 ms ON, 2300 ms OFF */
             gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 1);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(300));
             gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 0);
-            vTaskDelay(pdMS_TO_TICKS(2500));
+            vTaskDelay(pdMS_TO_TICKS(2300));
         }
     }
 }
@@ -1226,8 +1226,7 @@ void app_main(void) {
     if (local_button_task_handle == NULL) {
         xTaskCreate(local_button_task, "local_button", 2048, NULL, 5, &local_button_task_handle);
     }
-  //  xTaskCreate(demo_task, "demo_task", 3072, NULL, 8, &demo_task_handle);
-    
+    //  xTaskCreate(demo_task, "demo_task", 3072, NULL, 8, &demo_task_handle);  
     // Note: modem_init_task is created on-demand using start_modem_init_task()
 
     /* Config shell on console (same UART as monitor): SET/GET unit_id and status_reg. */
@@ -1236,10 +1235,10 @@ void app_main(void) {
     }
 
     ESP_LOGI(TAG, "UART AT Command System initialized successfully");
-    ESP_LOGI(TAG, "- UART: Port %d, TX: GPIO%d, RX: GPIO%d, Baud: %d", 
-             UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_BAUD_RATE);
-    ESP_LOGI(TAG, "- AT Command Queue Size: %d", AT_QUEUE_SIZE);
-    ESP_LOGI(TAG, "- Default AT Timeout: %d ms", AT_TIMEOUT_MS);
+    // ESP_LOGI(TAG, "- UART: Port %d, TX: GPIO%d, RX: GPIO%d, Baud: %d", 
+    //          UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_BAUD_RATE);
+    // ESP_LOGI(TAG, "- AT Command Queue Size: %d", AT_QUEUE_SIZE);
+    // ESP_LOGI(TAG, "- Default AT Timeout: %d ms", AT_TIMEOUT_MS);
     ESP_LOGI(TAG, "- Modem init task: Use start_modem_init_task() to activate");
     
     // Demonstrate the task control system
@@ -1256,7 +1255,7 @@ void app_main(void) {
     /* Start modem only if not disabled by status_reg (bit 4). Use SET status_reg=0x0010 then REBOOT to disable modem when not assembled. */
     {
         uint16_t sr = nvs_config_get_status_reg(0x0000);
-        if (sr & 0x0010) {  /* STATUS_DISABLE_MODEM */
+        if (sr & 0x0010) {  /* STATUS_DISABLE_MODEM bit high means modem init is disabled */
             ESP_LOGI(TAG, "Modem init disabled by status_reg (bit 4) – skipping start_modem_init()");
         } else {
             start_modem_init();

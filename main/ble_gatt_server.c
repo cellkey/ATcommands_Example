@@ -30,7 +30,7 @@ static const char *TAG = "BLE_GATT";
 
 /* BLE status LED: blink when not connected, solid ON when BLE connected.
  * Set STATUS_LED_ACTIVE_LOW if your LED is on when GPIO is LOW (e.g. common anode). */
-#define STATUS_LED_GPIO     23
+#define STATUS_LED_GPIO     23  //on board led
 #define STATUS_LED_BLINK_MS 600
 /* #define STATUS_LED_ACTIVE_LOW   uncomment if LED is active-low */
 
