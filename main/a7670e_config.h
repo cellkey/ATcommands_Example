@@ -18,7 +18,7 @@
 #define A7670E_UNIT_ID        "cr18061950"
 
 /* FW version: compile-time constant used in GET request header (no NVS override). */
-#define A7670E_FW_VERSION     "3.0.01"
+#define A7670E_FW_VERSION     "3.0.99"
 
 /* Modem UART mapping (change pins to match your wiring).
  * NOTE: This board has relays on GPIO16/17, so we move the modem to UART1 on other GPIOs.

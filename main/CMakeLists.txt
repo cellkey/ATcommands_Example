@@ -1,6 +1,7 @@
 # CMakeLists.txt for Enhanced UART AT Command Example
 
 idf_component_register(SRCS  "Encryption.c"
+                             "fota_modem.c"
                              "ble_gatt_server.c"
                              "relay_control.c"
                              "server_keepalive.c"
@@ -18,5 +19,5 @@ idf_component_register(SRCS  "Encryption.c"
                             "modem_init_usage_example.c" 
                             "at_command_examples.c"
                             INCLUDE_DIRS "." ".."
-                            REQUIRES driver freertos esp_timer nvs_flash json bt)
+                            REQUIRES driver freertos esp_timer nvs_flash json bt app_update)
                              

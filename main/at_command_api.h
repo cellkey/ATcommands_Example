@@ -19,7 +19,7 @@ extern "C" {
 #endif
 
 // Constants
-#define LINE_BUFFER_SIZE      256                  // Single line buffer
+#define LINE_BUFFER_SIZE      512                  // Modem RX line / queue slot (FOTA binary chunks)
 #define UART_NUM_AT           UART_NUM_1           // UART port for AT commands
 
 // AT Command result enumeration
@@ -59,6 +59,12 @@ at_result_t wait_for_line_containing(const char *substr, uint32_t timeout_ms);
 
 /** Get next line from modem response queue (e.g. after AT+CIPRXGET=2 to drain payload). Returns true if got line. */
 bool get_next_response_line(char *buf, size_t buf_size, uint32_t timeout_ms);
+
+/**
+ * Same as get_next_response_line but returns original byte length (may include embedded \\0 before end).
+ * @param out_len  if non-NULL, set to payload length in queue (not including your added NUL).
+ */
+bool get_next_response_line_ex(char *buf, size_t buf_size, size_t *out_len, uint32_t timeout_ms);
 
 /** Send raw bytes on UART (e.g. after CIPSEND ">"). Use after send_at_command_ex(..., ">", ..., false). */
 void uart_send_raw_bytes(const uint8_t *data, size_t len);

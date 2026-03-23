@@ -21,6 +21,7 @@
 #include "modem_task_control.h"
 #include "nvs_flash.h"
 #include "nvs_config.h"
+#include "fota_modem.h"
 #include "config_uart.h"
 #include "at_command_examples.h"
 
@@ -38,7 +39,7 @@ extern void start_tcp_examples(void);
 #define UART_BAUD_RATE        115200
 #define UART_BUF_SIZE         1024                 // Driver buffer size
 #define RX_BUFFER_SIZE        1024                 // User buffer (bursts: RING/+CLIP/+CLCC/+CGEV)
-#define LINE_BUFFER_SIZE      256                  // Single line buffer
+#define LINE_BUFFER_SIZE      512                  // Must match at_command_api.h (FOTA / long URC lines)
 #define MAX_AT_COMMAND_LEN    64                   // Maximum AT command length
 #define MAX_EXPECTED_RESP_LEN 64                   // Maximum expected response length
 #define AT_TIMEOUT_MS         5000                 // AT command timeout in ms
@@ -88,6 +89,10 @@ static SemaphoreHandle_t response_ready_sem;
 
 // Response queue for handling multiple quick responses (URCs: RING, +CLIP, +CLCC, +CGEV, +CIPRXGET, etc.)
 #define RESPONSE_QUEUE_SIZE 24
+typedef struct {
+    uint16_t len;
+    char data[LINE_BUFFER_SIZE];
+} modem_rsp_line_t;
 static QueueHandle_t response_queue;
 
 // Task control variables
@@ -116,7 +121,7 @@ static void uart_rx_task(void *arg);
 static void at_command_task(void *arg);
 static void modem_init_task(void *arg);
 at_result_t send_at_command(const char *command, const char *expected_response, uint32_t timeout_ms);
-static bool process_line(const char *line);
+static bool process_line(const char *line, size_t line_len);
 static bool response_matches(const char *response, const char *expected);
 
 // Task control functions (public API)
@@ -176,22 +181,42 @@ static void process_rx_buffer(void) {
             line_len--;
         }
 
-        if (line_len < LINE_BUFFER_SIZE - 1) {
-            memcpy(line_buffer, start, line_len);
-            line_buffer[line_len] = '\0';
+        size_t eff_len = line_len;
+        if (eff_len >= LINE_BUFFER_SIZE) {
+            ESP_LOGW(TAG, "RX line %u bytes, truncating to %d", (unsigned)eff_len, LINE_BUFFER_SIZE - 1);
+            eff_len = LINE_BUFFER_SIZE - 1;
+        }
+        memcpy(line_buffer, start, eff_len);
+        line_buffer[eff_len] = '\0';
 
-            /* Normalize any stray '\r' inside the line (some modems echo "AT\r\r\nOK\r\n"). */
-            for (size_t i = 0; i < line_len; ++i) {
-                if (line_buffer[i] == '\r') line_buffer[i] = ' ';
+        /* Normalize any stray '\r' inside the line (some modems echo "AT\r\r\nOK\r\n"). */
+        for (size_t i = 0; i < eff_len; ++i) {
+            if (line_buffer[i] == '\r') {
+                line_buffer[i] = ' ';
             }
+        }
 
-            /* Skip leading whitespace/CR/LF so URCs like "\r\n+CIPRXGET: 1,1" are matched. */
-            char *p = line_buffer;
-            while (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') p++;
-            if (*p != '\0') {
+        /* Skip leading whitespace/CR/LF so URCs like "\r\n+CIPRXGET: 1,1" are matched. */
+        char *p = line_buffer;
+        while (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p != '\0') {
+            size_t plen = eff_len - (size_t)(p - line_buffer);
+            bool looks_text = true;
+            for (size_t i = 0; i < plen && i < 80; i++) {
+                unsigned char c = (unsigned char)p[i];
+                if (c < 0x20u && c != '\t' && c != '\r' && c != '\n') {
+                    looks_text = false;
+                    break;
+                }
+            }
+            if (looks_text && plen < 200) {
                 ESP_LOGI(TAG, "RX Line: %s", p);
-                process_line(p);
+            } else {
+                ESP_LOGI(TAG, "RX chunk: %u bytes", (unsigned)plen);
             }
+            process_line(p, plen);
         }
 
         /* Advance past '\n'. */
@@ -227,7 +252,7 @@ static void process_rx_buffer(void) {
             line_buffer[0] = '>';
             line_buffer[1] = '\0';
             ESP_LOGI(TAG, "RX Line: %s", line_buffer);
-            process_line(line_buffer);
+            process_line(line_buffer, 1);
             rx_buffer_pos = 0;
         }
     }
@@ -236,7 +261,7 @@ static void process_rx_buffer(void) {
 /**
  * @brief Process a complete line received from modem
  */
-static bool process_line(const char *line) {
+static bool process_line(const char *line, size_t line_len) {
     /* Modem boot URCs (cold power-up): use as a gate before starting AT traffic. */
     if (strcmp(line, "*ATREADY: 1") == 0) {
         s_modem_urc_atready = true;
@@ -279,18 +304,17 @@ static bool process_line(const char *line) {
         }
     }
 
-    // Copy response for AT command handler (keep for backward compatibility)
-    strncpy(last_response, line, LINE_BUFFER_SIZE - 1);
-    last_response[LINE_BUFFER_SIZE - 1] = '\0';
-    
-    // Also queue the response for sequential processing
-    char response_copy[LINE_BUFFER_SIZE];
-    strncpy(response_copy, line, LINE_BUFFER_SIZE - 1);
-    response_copy[LINE_BUFFER_SIZE - 1] = '\0';
-    
-    // Try to send to response queue (non-blocking)
-    if (xQueueSend(response_queue, response_copy, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Response queue full, dropping: %s", line);
+    /* Copy for AT command handler (NUL-terminated; may truncate for display). */
+    size_t lr = line_len < LINE_BUFFER_SIZE - 1 ? line_len : LINE_BUFFER_SIZE - 1;
+    memcpy(last_response, line, lr);
+    last_response[lr] = '\0';
+
+    modem_rsp_line_t item;
+    item.len = (uint16_t)(line_len > LINE_BUFFER_SIZE ? LINE_BUFFER_SIZE : line_len);
+    memcpy(item.data, line, item.len);
+
+    if (xQueueSend(response_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Response queue full, dropping (%u bytes)", (unsigned)item.len);
     }
     
     // Signal that a response is ready
@@ -462,25 +486,29 @@ static void at_command_task(void *arg) {
                 while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
                     if (xSemaphoreTake(response_ready_sem, pdMS_TO_TICKS(100)) == pdTRUE) {
                         // Process all available responses in the queue
-                        char current_response[LINE_BUFFER_SIZE];
-                        while (xQueueReceive(response_queue, current_response, 0) == pdTRUE) {
-                            ESP_LOGD(TAG, "AT response: %s", current_response);
+                        modem_rsp_line_t rsp;
+                        char current_response[LINE_BUFFER_SIZE + 1];
+                        while (xQueueReceive(response_queue, &rsp, 0) == pdTRUE) {
+                            size_t cn = rsp.len < LINE_BUFFER_SIZE ? rsp.len : LINE_BUFFER_SIZE;
+                            memcpy(current_response, rsp.data, cn);
+                            current_response[cn] = '\0';
+                            ESP_LOGD(TAG, "AT response (%u bytes)", (unsigned)rsp.len);
                             // Check for error responses first (always priority)
-                            if (strstr(current_response, "ERROR") != NULL || 
+                            if (strstr(current_response, "ERROR") != NULL ||
                                 strstr(current_response, "FAIL") != NULL) {
                                 *cmd.result = AT_RESULT_ERROR;
                                 ESP_LOGW(TAG, "AT command ERROR: %s", current_response);
                                 goto command_complete;
                             }
-                            
+
                             // Phase 1: Check for expected data response (if expected)
                             if (expect_data && !data_received && response_matches(current_response, cmd.expected_response)) {
                                 data_received = true;
-                                strncpy(last_response, current_response, LINE_BUFFER_SIZE - 1);
-                                last_response[LINE_BUFFER_SIZE - 1] = '\0';
-                                strncpy(last_matched_response, current_response, LINE_BUFFER_SIZE - 1);
-                                last_matched_response[LINE_BUFFER_SIZE - 1] = '\0';
-                                ESP_LOGD(TAG, "Data response received: %s", current_response);
+                                memcpy(last_response, rsp.data, cn);
+                                last_response[cn] = '\0';
+                                memcpy(last_matched_response, rsp.data, cn);
+                                last_matched_response[cn] = '\0';
+                                ESP_LOGD(TAG, "Data response received (%u bytes)", (unsigned)rsp.len);
                                 
                                 // If we don't need to wait for OK, we're done
                                 if (!cmd.wait_for_ok) {
@@ -605,13 +633,17 @@ at_result_t send_at_command(const char *command, const char *expected_response, 
  * @brief Wait for a line containing substr from modem (e.g. "200 OK"). Call when no AT command is in progress.
  */
 at_result_t wait_for_line_containing(const char *substr, uint32_t timeout_ms) {
-    char buffer[LINE_BUFFER_SIZE];
+    modem_rsp_line_t item;
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
     while ((xTaskGetTickCount() - start) < timeout_ticks) {
-        if (xQueueReceive(response_queue, buffer, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (xQueueReceive(response_queue, &item, pdMS_TO_TICKS(200)) == pdTRUE) {
+            size_t n = item.len < LINE_BUFFER_SIZE ? item.len : LINE_BUFFER_SIZE;
+            /* NUL for strstr only; binary lines rarely contain substr. */
+            char buffer[LINE_BUFFER_SIZE + 1];
+            memcpy(buffer, item.data, n);
+            buffer[n] = '\0';
             if (strstr(buffer, substr) != NULL) {
-              //  ESP_LOGI(TAG, "wait_for_line: found '%s' in '%s'", substr, buffer);
                 return AT_RESULT_SUCCESS;
             }
         }
@@ -623,13 +655,31 @@ at_result_t wait_for_line_containing(const char *substr, uint32_t timeout_ms) {
 /**
  * @brief Get next line from response queue (for draining payload after AT+CIPRXGET=2,1).
  */
-bool get_next_response_line(char *buf, size_t buf_size, uint32_t timeout_ms) {
-    if (buf == NULL || buf_size == 0) return false;
-    char tmp[LINE_BUFFER_SIZE];
-    if (xQueueReceive(response_queue, tmp, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
-    strncpy(buf, tmp, buf_size - 1);
-    buf[buf_size - 1] = '\0';
+bool get_next_response_line_ex(char *buf, size_t buf_size, size_t *out_len, uint32_t timeout_ms)
+{
+    if (buf == NULL || buf_size == 0) {
+        return false;
+    }
+    modem_rsp_line_t item;
+    if (xQueueReceive(response_queue, &item, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return false;
+    }
+    size_t copy = item.len < buf_size ? item.len : buf_size;
+    memcpy(buf, item.data, copy);
+    if (copy < buf_size) {
+        buf[copy] = '\0';
+    } else {
+        buf[buf_size - 1] = '\0';
+    }
+    if (out_len != NULL) {
+        *out_len = item.len;
+    }
     return true;
+}
+
+bool get_next_response_line(char *buf, size_t buf_size, uint32_t timeout_ms)
+{
+    return get_next_response_line_ex(buf, buf_size, NULL, timeout_ms);
 }
 
 /**
@@ -1097,6 +1147,9 @@ void app_main(void) {
     /* If unit_id key is empty, write default so it can be changed later via SET unit_id=... */
     nvs_config_ensure_unit_id_default(A7670E_UNIT_ID);
 
+    /* After OTA: confirm image so bootloader rollback does not revert on next reset. */
+    fota_mark_current_app_valid_if_needed();
+
     /* Status register: read from NVS and check mode bits (ready for mode logic implementation). */
     {
         uint16_t status_reg = nvs_config_get_status_reg(0x0000);  // default 0x0000 if not set
@@ -1191,7 +1244,7 @@ void app_main(void) {
     uart_mutex = xSemaphoreCreateMutex();
     response_ready_sem = xSemaphoreCreateBinary();
     init_control_mutex = xSemaphoreCreateMutex();
-    response_queue = xQueueCreate(RESPONSE_QUEUE_SIZE, sizeof(char[LINE_BUFFER_SIZE]));
+    response_queue = xQueueCreate(RESPONSE_QUEUE_SIZE, sizeof(modem_rsp_line_t));
     
     if (at_command_queue == NULL || uart_mutex == NULL || response_ready_sem == NULL || 
         init_control_mutex == NULL || response_queue == NULL) {
@@ -1251,6 +1304,7 @@ void app_main(void) {
 //==========================================================================
     // Uncomment the line below to automatically run the modem init options examples:
     // code in file: modem_init_usage_example.c
+
 
     /* Start modem only if not disabled by status_reg (bit 4). Use SET status_reg=0x0010 then REBOOT to disable modem when not assembled. */
     {

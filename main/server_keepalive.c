@@ -15,6 +15,7 @@
 #include "relay_control.h"
 #include "a7670e_sequences.h"
 #include "nvs_config.h"
+#include "fota_modem.h"
 
 static const char *TAG = "SRV_KA";
 
@@ -93,6 +94,12 @@ void server_handle_incoming_line(const char *line) {
 
     /* Any other line resets the simple KA ACK sequence state */
     s_saw_ka_one = false;
+
+    /* --- FOTA: server sends length line "4" then "FOTA" (we only match payload line). --- */
+    if (strcmp(line, "FOTA") == 0) {
+        fota_on_server_invite();
+        return;
+    }
 
     /* --- CHECK_USER response (only when we sent CHECK_USER after a ring) --- */
     if (s_waiting_check_user_response) {
@@ -303,6 +310,7 @@ void server_on_ring(const char *caller_id) {
 void server_on_ipclose(int link_id) {
     if (link_id != SERVER_TCP_LINK_ID) return;
     ESP_LOGI(TAG, "+IPCLOSE: link %d (server disconnected)", link_id);
+    fota_on_tcp_disconnected();
     s_pending_ipclose_reconnect = true;
 
     /* Normal case: keepalive task is running – let it handle emergency re-init. */
@@ -328,6 +336,7 @@ void server_on_ipclose(int link_id) {
 static void do_read_buffered_data(int link_id) {
     char cmd[32];
     char line[LINE_BUFFER_SIZE];
+    size_t payload_len = 0;
     int len = 0, extra = 0;
 
     snprintf(cmd, sizeof(cmd), "AT+CIPRXGET=2,%d", link_id);
@@ -350,11 +359,20 @@ static void do_read_buffered_data(int link_id) {
         s_check_user_approved = -1;
     }
 
-    while (get_next_response_line(line, sizeof(line), 2000)) {
+    while (get_next_response_line_ex(line, sizeof(line), &payload_len, 2000)) {
         const char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (p[0] == 'O' && p[1] == 'K' && (p[2] == '\0' || p[2] == ' ' || p[2] == '\t')) break;
-        server_handle_incoming_line(line);
+        if (fota_session_active()) {
+            fota_feed_modem_payload((const uint8_t *)line, payload_len);
+        } else {
+            size_t lead = (size_t)(p - line);
+            size_t pay = payload_len > lead ? payload_len - lead : 0;
+            size_t zl = pay < sizeof(line) - 1 ? pay : sizeof(line) - 1;
+            memmove(line, p, zl);
+            line[zl] = '\0';
+            server_handle_incoming_line(line);
+        }
     }
 
     if (s_ka_ack_since_read) {
@@ -400,6 +418,9 @@ static void server_keepalive_task(void *arg) {
     (void)arg;
     ESP_LOGI(TAG, "Keepalive task started: KA in %d s", SERVER_KA_FIRST_DELAY_SEC);
 
+    /* One-shot notify after FOTA reboot (placeholder frame; replace in fota_modem.c). */
+    fota_try_send_pending_success_notify();
+
     /* First KA after SERVER_KA_FIRST_DELAY_SEC (e.g. 8 s) */
     vTaskDelay(pdMS_TO_TICKS((uint32_t)SERVER_KA_FIRST_DELAY_SEC * 1000));
     if (!s_ka_task_running) {
@@ -407,7 +428,9 @@ static void server_keepalive_task(void *arg) {
     }
     //ESP_LOGI(TAG, "First KA now (after %d s delay)", SERVER_KA_FIRST_DELAY_SEC);
     /* Same mechanism as OPENED ack: send_at_then_raw_data(link_id, len, payload) → AT+CIPSEND=1,len, ">", raw bytes */
-    if (send_at_then_raw_data(SERVER_TCP_LINK_ID, (int)KEEP_ALIVE_LEN, KEEP_ALIVE) == AT_RESULT_SUCCESS) {
+    if (fota_session_active()) {
+        /* FOTA started before first KA — do not count as send failure. */
+    } else if (send_at_then_raw_data(SERVER_TCP_LINK_ID, (int)KEEP_ALIVE_LEN, KEEP_ALIVE) == AT_RESULT_SUCCESS) {
       /*   ESP_LOGI(TAG, "KEEP_ALIVE sent (%d bytes): \"1\\r\\nA\\r\\n\" (ATMEGA format)", (int)KEEP_ALIVE_LEN);
         ESP_LOGI(TAG, "KEEP_ALIVE bytes (hex): %02X %02X %02X %02X %02X %02X",
                  (unsigned)KEEP_ALIVE[0], (unsigned)KEEP_ALIVE[1], (unsigned)KEEP_ALIVE[2],
@@ -496,7 +519,7 @@ static void server_keepalive_task(void *arg) {
             goto exit_task;
         }
         /* n == 0: timeout (no pending read/ring). If previous KA was not ACKed, retry once after 8s or reconnect. */
-        if (n == 0 && s_ka_sent_waiting_ack) {
+        if (n == 0 && s_ka_sent_waiting_ack && !fota_session_active()) {
             if (!s_ka_retry_pending) {
                 ESP_LOGI(TAG, "KA not ACKed, retrying in 8 s");
                 vTaskDelay(pdMS_TO_TICKS(8000));
@@ -517,6 +540,12 @@ static void server_keepalive_task(void *arg) {
             }
             s_ka_sent_waiting_ack = false;
             s_ka_retry_pending = false;
+            continue;
+        }
+
+        if (fota_session_active()) {
+            /* Avoid CIPSEND keepalive while FOTA firmware is on the wire. */
+            vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
