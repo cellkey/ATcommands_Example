@@ -25,6 +25,7 @@
 #include "config_uart.h"
 #include "at_command_examples.h"
 #include "wifi_manager.h"
+#include "wifi_tcp_client.h"
 
 // Forward declaration for integration demo
 extern void start_integration_demo(void);
@@ -1284,6 +1285,7 @@ void app_main(void) {
     /* WiFi STA: background connect if wifi_ssid is set in NVS.
      * Configure: SET wifi_ssid=<name>  SET wifi_pass=<pass>  REBOOT */
     wifi_manager_init();
+    wifi_tcp_client_start();    /* Phase 2: TCP to server over WiFi */
 
     /* After OTA: confirm image so bootloader rollback does not revert on next reset. */
     fota_mark_current_app_valid_if_needed();
