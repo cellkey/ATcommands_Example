@@ -36,7 +36,7 @@ static esp_timer_handle_t        s_reconnect_timer  = NULL;
 /*
  *  Not connected to network  →  steady ON
  *  Connected to network      →  blink 500 ms ON / 500 ms OFF
- *  Connected to server       →  blink 800 ms ON / 200 ms OFF  (Phase 2)
+ *  Connected to server       →  blink 200 ms ON / 1500 ms OFF
  */
 static void wifi_status_led_task(void *arg)
 {
@@ -47,11 +47,11 @@ static void wifi_status_led_task(void *arg)
 
     while (1) {
         if (s_server_connected) {
-            /* Phase 2: server TCP up → 800 ms ON / 200 ms OFF */
+            /* Server TCP up → 200 ms ON / 1500 ms OFF */
             gpio_set_level(WIFI_STATUS_LED_GPIO, 1);
-            vTaskDelay(pdMS_TO_TICKS(800));
-            gpio_set_level(WIFI_STATUS_LED_GPIO, 0);
             vTaskDelay(pdMS_TO_TICKS(200));
+            gpio_set_level(WIFI_STATUS_LED_GPIO, 0);
+            vTaskDelay(pdMS_TO_TICKS(1500));
         } else if (s_state == WIFI_MGR_STATE_CONNECTED) {
             /* Local network only → 500 ms ON / 500 ms OFF */
             gpio_set_level(WIFI_STATUS_LED_GPIO, 1);
