@@ -1282,10 +1282,15 @@ void app_main(void) {
         gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);
     }
 
-    /* WiFi STA: background connect if wifi_ssid is set in NVS.
-     * Configure: SET wifi_ssid=<name>  SET wifi_pass=<pass>  REBOOT */
-    wifi_manager_init();
-    wifi_tcp_client_start();    /* Phase 2: TCP to server over WiFi */
+    /* WiFi: only when modem is disabled (bit4 clear = WiFi-only mode).
+     * When modem is active WiFi is fully skipped — site-specific credentials
+     * won't be configured on modem deployments.
+     * Future: STATUS_MODEM_SLAVE (0x0030) will re-enable WiFi alongside modem
+     *         for voice/ring-only modem + WiFi data path. */
+    if (modem_disabled) {
+        wifi_manager_init();
+        wifi_tcp_client_start();
+    }
 
     /* After OTA: confirm image so bootloader rollback does not revert on next reset. */
     fota_mark_current_app_valid_if_needed();
