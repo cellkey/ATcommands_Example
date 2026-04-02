@@ -8,7 +8,8 @@ idf_component_register(SRCS  "Encryption.c"
                              "digital_input_alert.c"
                              "a7670e_sequences.c"
                              "nvs_config.c"
-                             "config_uart.c"   
+                             "config_uart.c"
+                             "wifi_manager.c"
                              "enhanced_freertos_uart_at_commands.c" 
                             "force_callback_triggers.c" 
                             "Modem_Config_Handling.c" 
@@ -19,5 +20,6 @@ idf_component_register(SRCS  "Encryption.c"
                             "modem_init_usage_example.c" 
                             "at_command_examples.c"
                             INCLUDE_DIRS "." ".."
-                            REQUIRES driver freertos esp_timer nvs_flash json bt app_update)
+                            REQUIRES driver freertos esp_timer nvs_flash json bt app_update
+                                     esp_wifi esp_netif esp_event)
                              

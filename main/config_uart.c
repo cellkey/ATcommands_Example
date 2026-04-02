@@ -5,6 +5,7 @@
 
 #include "config_uart.h"
 #include "nvs_config.h"
+#include "wifi_manager.h"   /* WIFI_MGR_SSID_MAX / WIFI_MGR_PASS_MAX, NVS_KEY_WIFI_* */
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -109,15 +110,26 @@ static bool parse_hex_uint16(const char *hex_str, uint16_t *out) {
 
 static void list_all(void) {
     char buf[NVS_CONFIG_MAX_LEN];
-    nvs_config_get_string(NVS_KEY_UNIT_ID,   buf, sizeof(buf), "");
     char line[NVS_CONFIG_MAX_LEN + 16];
+
+    nvs_config_get_string(NVS_KEY_UNIT_ID, buf, sizeof(buf), "");
     snprintf(line, sizeof(line), "unit_id=%s", buf[0] ? buf : "(default)");
     send_line(line);
+
     nvs_config_get_string(NVS_KEY_FW_VER, buf, sizeof(buf), "");
     snprintf(line, sizeof(line), "fw_ver=%s", buf[0] ? buf : "(default)");
     send_line(line);
+
     uint16_t status_reg = nvs_config_get_status_reg(0x0000);
     snprintf(line, sizeof(line), "status_reg=0x%04X", status_reg);
+    send_line(line);
+
+    nvs_config_get_string(NVS_KEY_WIFI_SSID, buf, sizeof(buf), "");
+    snprintf(line, sizeof(line), "wifi_ssid=%s", buf[0] ? buf : "(not set)");
+    send_line(line);
+
+    nvs_config_get_string(NVS_KEY_WIFI_PASS, buf, sizeof(buf), "");
+    snprintf(line, sizeof(line), "wifi_pass=%s", buf[0] ? "****" : "(not set)");
     send_line(line);
 }
 
@@ -130,8 +142,9 @@ static void config_uart_task(void *arg) {
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     send_line("=== Config Shell Ready ===");
-    send_line("Commands: SET key=val | GET key | LIST | REBOOT");
-    send_line("CFG> prompt appears when typing. Logs may scroll, but your input will be captured.");
+    send_line("Commands : SET key=val | GET key | LIST | REBOOT");
+    send_line("Keys     : unit_id  fw_ver  status_reg  wifi_ssid  wifi_pass");
+    send_line("Modem on : SET status_reg=0x0010 -> REBOOT  (off/default: SET status_reg=0x0000 -> REBOOT)");
     printf("CFG> ");
     fflush(stdout);
 
@@ -182,8 +195,22 @@ static void config_uart_task(void *arg) {
                     send_line("OK saved");
                 } else
                     send_line("ERR NVS write failed");
+            } else if (strcmp(key, "wifi_ssid") == 0) {
+                if (strlen(val) >= WIFI_MGR_SSID_MAX) {
+                    send_line("ERR SSID too long (max 32 chars)");
+                } else if (nvs_config_set_string(NVS_KEY_WIFI_SSID, val)) {
+                    send_line("OK wifi_ssid saved (REBOOT to apply)");
+                } else
+                    send_line("ERR NVS write failed");
+            } else if (strcmp(key, "wifi_pass") == 0) {
+                if (strlen(val) >= WIFI_MGR_PASS_MAX) {
+                    send_line("ERR password too long (max 63 chars)");
+                } else if (nvs_config_set_string(NVS_KEY_WIFI_PASS, val)) {
+                    send_line("OK wifi_pass saved (REBOOT to apply)");
+                } else
+                    send_line("ERR NVS write failed");
             } else
-                send_line("ERR unknown key (unit_id,fw_ver,status_reg)");
+                send_line("ERR unknown key (unit_id,fw_ver,status_reg,wifi_ssid,wifi_pass)");
         } else if (strncasecmp(line, "GET ", 4) == 0) {
             char *key = line + 4;
             trim(key);
@@ -193,14 +220,21 @@ static void config_uart_task(void *arg) {
                 snprintf(buf, sizeof(buf), "0x%04X", reg_val);
                 send_line(buf);
             } else {
-                const char *nkey = NULL;
-                if (strcmp(key, "unit_id") == 0) nkey = NVS_KEY_UNIT_ID;
-                if (strcmp(key, "fw_ver")  == 0) nkey = NVS_KEY_FW_VER;
-                if (nkey) {
-                    nvs_config_get_string(nkey, buf, sizeof(buf), "");
-                    send_line(buf[0] ? buf : "(not set)");
-                } else
-                    send_line("ERR unknown key");
+                if (strcmp(key, "wifi_pass") == 0) {
+                    /* Never echo the password in plaintext. */
+                    nvs_config_get_string(NVS_KEY_WIFI_PASS, buf, sizeof(buf), "");
+                    send_line(buf[0] ? "****" : "(not set)");
+                } else {
+                    const char *nkey = NULL;
+                    if (strcmp(key, "unit_id")   == 0) nkey = NVS_KEY_UNIT_ID;
+                    if (strcmp(key, "fw_ver")    == 0) nkey = NVS_KEY_FW_VER;
+                    if (strcmp(key, "wifi_ssid") == 0) nkey = NVS_KEY_WIFI_SSID;
+                    if (nkey) {
+                        nvs_config_get_string(nkey, buf, sizeof(buf), "");
+                        send_line(buf[0] ? buf : "(not set)");
+                    } else
+                        send_line("ERR unknown key");
+                }
             }
         } else if (strcasecmp(line, "LIST") == 0) {
             list_all();

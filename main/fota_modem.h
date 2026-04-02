@@ -3,14 +3,17 @@
  * @brief ESP-IDF OTA over modem TCP — unit/server FOTA protocol.
  *
  * Server invite: 4\\r\\nFOTA\\r\\n (length line + payload line; unit reacts to line "FOTA").
- * Unit accepts: 10\\r\\nSTART_FOTA\\r\\n
+ * Unit sends: a\\r\\nSTART_FOTA\\r\\n (15 bytes; length line is single char "a", not decimal "10")
  *
  * Firmware stream (after START_FOTA), one of:
- *   - Header: first segment is 1–5 ASCII digits (file size), then 9 bytes (6 char CS + 3 char type, ignored).
- *   - Raw legacy: first byte 0xE9 (ESP32 image magic), then binary until a line FOTA_DONE (8 bytes, no CRLF in segment).
- *   - Raw legacy (no magic match): treat first segment as start of .bin until FOTA_DONE.
+ *   - Sized: first line is file size in ASCII — 1–5 decimal digits or 1–8 hex digits (e.g. c9c00), with
+ *     optional trim of \\r\\n/spaces. Next bytes on the socket are raw .bin for exactly that count
+ *     (no 6+3 CS/type prefix).
+ *   - Raw: first byte 0xE9 (ESP32 image magic), then binary until line FOTA_DONE (9 ASCII chars;
+ *     optional \\r/\\n/space trim like the size line).
+ *   - Raw fallback: first segment not all-digits and not 0xE9 — treat as start of .bin until FOTA_DONE.
  *
- * Sized header path: after exactly "size" firmware bytes, unit validates and reboots (no FOTA_DONE).
+ * Sized path: after exactly "size" bytes written, unit validates and reboots (no FOTA_DONE).
  *
  * After successful boot: unit sends 7\\r\\nFOTA_OK\\r\\n once (NVS pending flag).
  * On failure: a\\r\\nFOTA_ERROR\\r\\n (15 bytes on the wire; FOTA_ERROR is 10 chars)
@@ -39,6 +42,12 @@ void fota_try_send_pending_success_notify(void);
 
 /** True while FOTA transfer is active (suppress competing KA traffic if desired). */
 bool fota_session_active(void);
+
+/** Sized FOTA: still receiving image body (modem may hold more bytes without a new URC). */
+bool fota_sized_body_incomplete(void);
+
+/** Bytes left in sized body (0 if not in FOTA_ST_BODY). */
+uint32_t fota_body_bytes_remaining(void);
 
 /**
  * Server sent FOTA invite (line "FOTA" after length line "4"). Starts OTA partition, sends START_FOTA.

@@ -18,7 +18,7 @@
 #define A7670E_UNIT_ID        "cr18061950"
 
 /* FW version: compile-time constant used in GET request header (no NVS override). */
-#define A7670E_FW_VERSION     "3.0.99"
+#define A7670E_FW_VERSION     "3.0.03"
 
 /* Modem UART mapping (change pins to match your wiring).
  * NOTE: This board has relays on GPIO16/17, so we move the modem to UART1 on other GPIOs.
@@ -34,6 +34,7 @@
 #define A7670E_MODEM_STATUS_LED_GPIO  2   /* Active-high: ON during init, blink when connected */
 #define A7670E_LOCAL_BUTTON_GPIO      15  /* Active-low external button with pull-up: press = LOW pulse */
 
+
 /* Timeouts */
 #define A7670E_CIPOPEN_TIMEOUT_MS    4500  /* wait for +CIPOPEN: 1,0 URC (modem sends OK then +CIPOPEN: 1,x) */
 #define A7670E_CIPSEND_TIMEOUT_MS    1500
@@ -42,5 +43,6 @@
 /* AT+CREG? retry: default 20 trials, 3 s between; tune based on experience (e.g. weak signal → increase). */
 #define A7670E_CREG_MAX_TRIES        20
 #define A7670E_CREG_RETRY_DELAY_SEC  2
+
 
 #endif /* A7670E_CONFIG_H */

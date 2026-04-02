@@ -19,7 +19,8 @@ extern "C" {
 #endif
 
 // Constants
-#define LINE_BUFFER_SIZE      512                  // Modem RX line / queue slot (FOTA binary chunks)
+/* >= modem CIPRXGET payload (~1500) so one binary segment without \\n is not truncated. */
+#define LINE_BUFFER_SIZE      1600
 #define UART_NUM_AT           UART_NUM_1           // UART port for AT commands
 
 // AT Command result enumeration

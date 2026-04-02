@@ -18,6 +18,64 @@
 
 static const char *TAG = "A7670E";
 
+/** Scan binary-safe for HTTP status substring. */
+static bool payload_has_200_ok(const char *buf, size_t len)
+{
+    static const char pat[] = "200 OK";
+    const size_t plen = sizeof(pat) - 1u;
+    if (buf == NULL || len < plen) {
+        return false;
+    }
+    for (size_t i = 0; i + plen <= len; ++i) {
+        if (memcmp(buf + i, pat, plen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Wait for HTTP "200 OK" while TCP is in modem buffer (CIPRXGET=1).
+ * Avoids AT+CIPRXGET=0 + wait_for_line_containing, which pushes server data as +IPD on the UART
+ * and fills the AT response_queue when the server spams (e.g. stale FOTA file after reboot).
+ */
+static at_result_t wait_for_http_200_via_ciprxget(int link_id, uint32_t timeout_ms)
+{
+    char cmd[40];
+    char line[LINE_BUFFER_SIZE];
+    size_t payload_len = 0;
+    TickType_t start = xTaskGetTickCount();
+    const TickType_t tmo = pdMS_TO_TICKS(timeout_ms);
+
+    snprintf(cmd, sizeof(cmd), "AT+CIPRXGET=2,%d", link_id);
+
+    while ((xTaskGetTickCount() - start) < tmo) {
+        if (send_at_command_ex(cmd, "+CIPRXGET: 2", 3000, false) != AT_RESULT_SUCCESS) {
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
+        }
+
+        bool saw_200 = false;
+        while (get_next_response_line_ex(line, sizeof(line), &payload_len, 500)) {
+            const char *p = line;
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+            if (p[0] == 'O' && p[1] == 'K' && (p[2] == '\0' || p[2] == ' ' || p[2] == '\t')) {
+                break;
+            }
+            if (payload_has_200_ok(line, payload_len)) {
+                saw_200 = true;
+            }
+        }
+        if (saw_200) {
+            return AT_RESULT_SUCCESS;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return AT_RESULT_TIMEOUT;
+}
+
 /* Device info collected for GET part 2 (81 bytes) */
 typedef struct {
     char fw_version[32];
@@ -417,10 +475,12 @@ int run_a7670e_connect_and_register(void) {
     ESP_LOGI(TAG, "CIPOPEN success (+CIPOPEN: 1,0). Link ready for GET.");
     vTaskDelay(pdMS_TO_TICKS(300));  /* short settle before CIPSEND */
 
-    /* Unbuffered RX before GET so server response (+IPD176, HTTP/1.1 200 OK) is delivered immediately. */
-    if (send_at_command("AT+CIPRXGET=0", "OK", 2000) != AT_RESULT_SUCCESS) {
-        ESP_LOGW(TAG, "CIPRXGET=0 failed (continuing)");
+    /* Buffered RX *before* GET so server data (incl. huge stale bodies) stays in modem RAM, not +IPD on UART. */
+    if (send_at_command("AT+CIPRXGET=1", "OK", 2000) != AT_RESULT_SUCCESS) {
+        ESP_LOGE(TAG, "CIPRXGET=1 failed — cannot avoid UART flood on large TCP RX");
+        return -1;
     }
+    ESP_LOGI(TAG, "CIPRXGET=1 (buffered) before GET");
 
     /* Build full GET: unit_id and fw_ver from NVS (defaults from a7670e_config.h). */
     int n = snprintf(get_msg, sizeof(get_msg),
@@ -453,17 +513,12 @@ int run_a7670e_connect_and_register(void) {
     }
     ESP_LOGI(TAG, "GET (%u bytes) sent", (unsigned)get_len);
 
-    if (wait_for_line_containing("200 OK", A7670E_WAIT_200_OK_MS) != AT_RESULT_SUCCESS) {
-        ESP_LOGE(TAG, "Did not receive HTTP 200 OK");
+    if (wait_for_http_200_via_ciprxget(1, A7670E_WAIT_200_OK_MS) != AT_RESULT_SUCCESS) {
+        ESP_LOGE(TAG, "Did not receive HTTP 200 OK (CIPRXGET=2 poll)");
         return -1;
     }
     ESP_LOGI(TAG, "***Got 200 OK from server***");
 
-    if (send_at_command("AT+CIPRXGET=1", "OK", 2000) != AT_RESULT_SUCCESS) {
-        ESP_LOGW(TAG, "CIPRXGET=1 failed");
-    } else {
-        ESP_LOGI(TAG, "CIPRXGET=1 set (buffered URC)");
-    }
     ESP_LOGI(TAG, "In main loop..ready");
     return 0;
 }

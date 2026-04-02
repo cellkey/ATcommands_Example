@@ -22,6 +22,10 @@ extern "C" {
 #define NVS_KEY_SERVER_PORT   "port"
 #define NVS_KEY_STATUS_REG    "status_reg"
 
+/* WiFi STA credentials (optional – WiFi not started if wifi_ssid is empty). */
+#define NVS_KEY_WIFI_SSID     "wifi_ssid"
+#define NVS_KEY_WIFI_PASS     "wifi_pass"
+
 /* status_reg bit assignments (persisted in NVS):
  *  - Bit 0 (0x0001): Relay 1 kept active via KEEPOPEN[1] / KEEPOPEN[3] (permanent ON until CLOSE).
  *  - Bit 1 (0x0002): Relay 2 kept active via KEEPOPEN[2] (permanent ON until CLOSE).
