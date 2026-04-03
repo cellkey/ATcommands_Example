@@ -255,7 +255,8 @@ static void process_received(const uint8_t *data, int n) {
             handle_server_line(s_lbuf);
             s_llen = 0;
         } else {
-            if (s_llen < (int)sizeof(s_lbuf) - 1) s_lbuf[s_llen++] = c;
+            if (s_llen < (int)sizeof(s_lbuf) - 1) 
+            s_lbuf[s_llen++] = c;
         }
     }
 }
@@ -301,9 +302,10 @@ static bool read_http_headers(int sock) {
                 return strstr(hdr, " 200") != NULL;
             }
         } else if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            return false;
-        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+             continue;
+              return false;
+        } else {                                            
             return false; /* server closed before sending headers */
         }
     }
@@ -357,7 +359,7 @@ static void wifi_tcp_task(void *arg) {
         struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        ESP_LOGI(TAG, "Connecting to server …");
+      //  ESP_LOGI(TAG, "Connecting to server …");
         if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
             ESP_LOGE(TAG, "connect() failed (%d) — retry in 5 s", errno);
             close(sock);
@@ -366,7 +368,7 @@ static void wifi_tcp_task(void *arg) {
             continue;
         }
         freeaddrinfo(res);
-        ESP_LOGI(TAG, "TCP connected to %s:%d", A7670E_SERVER_HOST, A7670E_SERVER_PORT);
+        ESP_LOGI(TAG, "WIFI connected to:  %s:%d", A7670E_SERVER_HOST, A7670E_SERVER_PORT);
 
         /* ---- Phase 3: send GET registration ---- */
         nvs_config_get_string(NVS_KEY_UNIT_ID, unit_id, sizeof(unit_id), A7670E_UNIT_ID);
@@ -410,7 +412,7 @@ static void wifi_tcp_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(10000));
             continue;
         }
-        ESP_LOGI(TAG, "200 OK — entering keepalive loop");
+        ESP_LOGI(TAG, "200 OK — Server Connection Established");
         wifi_manager_set_server_connected(true);
 
         /* ---- Phase 5: keepalive loop ---- */
@@ -422,9 +424,9 @@ static void wifi_tcp_task(void *arg) {
             uint32_t elapsed = (uint32_t)(
                 (xTaskGetTickCount() - last_ka) * portTICK_PERIOD_MS);
             if (elapsed >= ka_delay) {
-                ESP_LOGI(TAG, "→ KA send");
+                ESP_LOGI(TAG, "→ KA →");
                 if (!send_all(sock, KEEP_ALIVE, sizeof(KEEP_ALIVE))) {
-                    ESP_LOGE(TAG, "KA send failed");
+                    ESP_LOGE(TAG, "KA sending failed");
                     break;
                 }
                 last_ka  = xTaskGetTickCount();

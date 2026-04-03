@@ -221,5 +221,5 @@ bool wifi_manager_get_ip(char *buf, size_t size)
 void wifi_manager_set_server_connected(bool connected)
 {
     s_server_connected = connected;
-    ESP_LOGI(TAG, "Server connection: %s", connected ? "UP (800/200 blink)" : "DOWN (500/500 blink)");
+    ESP_LOGI(TAG, "Server connection status: %s", connected ? "CONNECTED" : "NOT CONNECTED !");
 }
