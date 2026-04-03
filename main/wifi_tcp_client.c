@@ -245,7 +245,7 @@ static void handle_server_line(const char *line) {
  * handle_server_line() for each complete \r\n-terminated line.
  * Only called from wifi_tcp_task — no locking needed.
  * --------------------------------------------------------------------- */
-static void process_received(const uint8_t *data, int n) {
+static void process_received(const uint8_t *dae /Hta, int n) {
     for (int i = 0; i < n; i++) {
         char c = (char)data[i];
         if (c == '\n') {
