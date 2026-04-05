@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>  /* for strcasecmp/strncasecmp */
 #include "freertos/FreeRTOS.h"
@@ -19,8 +20,15 @@
 
 static const char *TAG = "SRV_KA";
 
+static void fota_modem_debug_log_snapshot(const char *reason);
+
 static TaskHandle_t s_ka_task_handle = NULL;
 static volatile bool s_ka_task_running = false;
+/* Sized FOTA: detect long stalls (same remaining count) → likely server/proxy idle timeout before +IPCLOSE. */
+static uint32_t s_fota_stall_last_remain = UINT32_MAX;
+static TickType_t s_fota_stall_since_tick;
+static bool s_fota_stall_timing;
+static TickType_t s_fota_trace_period_tick;
 static volatile bool s_pending_read = false;
 static volatile int s_pending_read_link = 1;
 /* Tracks whether a KA ACK (1/A sequence) was seen during the current buffered-read. */
@@ -309,7 +317,10 @@ void server_on_ring(const char *caller_id) {
 
 void server_on_ipclose(int link_id) {
     if (link_id != SERVER_TCP_LINK_ID) return;
-    ESP_LOGI(TAG, "+IPCLOSE: link %d (server disconnected)", link_id);
+    ESP_LOGI(TAG, "+IPCLOSE lk %d", link_id);
+    if (fota_session_active()) {
+        fota_modem_debug_log_snapshot("IPCLOSE(before_reset)");
+    }
     fota_on_tcp_disconnected();
     s_pending_ipclose_reconnect = true;
 
@@ -321,7 +332,7 @@ void server_on_ipclose(int link_id) {
 
     /* Special case: no keepalive task (e.g. connect/init failed earlier).
      * +IPCLOSE means we lost network – always trigger a fresh modem re-init. */
-    ESP_LOGI(TAG, "No KA task active on +IPCLOSE – starting full modem re-init/connect");
+    ESP_LOGI(TAG, "+IPCLOSE: no KA, modem reinit");
     if (is_modem_init_active()) {
         stop_modem_init_task();
         vTaskDelay(pdMS_TO_TICKS(300));
@@ -330,26 +341,108 @@ void server_on_ipclose(int link_id) {
         ESP_LOGW(TAG, "Failed to start modem init task from server_on_ipclose");
     }
 }
+/** Modem lines that must never be fed as TCP payload during FOTA (URCs also go through response_queue). */
+static bool fota_skip_modem_line(const char *p)
+{
+    return (strncmp(p, "+CIPRXGET:", 10) == 0 ||
+            strncmp(p, "+CIPSEND:", 9) == 0 ||
+            strncmp(p, "+IPCLOSE:", 9) == 0);
+}
+
+/* Last AT+CIPRXGET=2 outcome while sized FOTA (for stall / IPCLOSE logs). */
+static char s_fota_mdm_snap[144];
+static int s_fota_mdm_len = -999;
+static int s_fota_mdm_unread = -999;
+
+static void fota_mdm_snap_sanitize(char *dst, size_t dstsz, const char *src)
+{
+    if (dst == NULL || dstsz < 4) {
+        return;
+    }
+    if (src == NULL) {
+        snprintf(dst, dstsz, "(null)");
+        return;
+    }
+    size_t di = 0;
+    for (; *src != '\0' && di + 1 < dstsz; ++src) {
+        unsigned char c = (unsigned char)*src;
+        if (c >= 32 && c <= 126) {
+            dst[di++] = (char)c;
+        } else if (c == '\r' && di + 2 < dstsz) {
+            dst[di++] = '\\';
+            dst[di++] = 'r';
+        } else if (c == '\n' && di + 2 < dstsz) {
+            dst[di++] = '\\';
+            dst[di++] = 'n';
+        } else {
+            dst[di++] = '.';
+        }
+    }
+    dst[di] = '\0';
+}
+
+static void fota_mdm_snap_note_ok(int len, int unread)
+{
+    if (!fota_sized_body_incomplete()) {
+        return;
+    }
+    s_fota_mdm_len = len;
+    s_fota_mdm_unread = unread;
+    fota_mdm_snap_sanitize(s_fota_mdm_snap, sizeof(s_fota_mdm_snap), last_response);
+}
+
+static void fota_mdm_snap_note_fail(void)
+{
+    if (!fota_sized_body_incomplete()) {
+        return;
+    }
+    s_fota_mdm_len = -1;
+    s_fota_mdm_unread = -1;
+    fota_mdm_snap_sanitize(s_fota_mdm_snap, sizeof(s_fota_mdm_snap), last_response);
+}
+
+static void fota_modem_debug_log_snapshot(const char *reason)
+{
+    uint32_t rem = fota_body_bytes_remaining();
+    ESP_LOGW(TAG,
+             "FOTA modem [%s]: body_rem=%lu last_CIPread_len=%d modem_unread=%d AT_last=[%s]",
+             reason, (unsigned long)rem, s_fota_mdm_len, s_fota_mdm_unread, s_fota_mdm_snap);
+}
+
 /**
- * @brief Read buffered data: AT+CIPRXGET=2,<link>, then drain payload lines until OK and pass to server_handle_incoming_line.
+ * One AT+CIPRXGET=2 cycle: issue command, drain lines until OK, feed FOTA/server.
+ * @param out_unread if non-NULL, set to 4th field of +CIPRXGET: 2,... (bytes still in modem buffer), or 0 if absent.
+ * @return false if AT command failed.
  */
-static void do_read_buffered_data(int link_id) {
+static bool do_read_buffered_data_once(int link_id, int *out_unread) {
     char cmd[32];
     char line[LINE_BUFFER_SIZE];
     size_t payload_len = 0;
-    int len = 0, extra = 0;
+    int len = 0;
+    int unread = 0;
 
     snprintf(cmd, sizeof(cmd), "AT+CIPRXGET=2,%d", link_id);
     if (send_at_command_ex(cmd, "+CIPRXGET: 2", 3000, false) != AT_RESULT_SUCCESS) {
-        ESP_LOGW(TAG, "CIPRXGET=2,%d failed or timeout", link_id);
-        return;
+        ESP_LOGW(TAG, "CIPRXGET=2 lk%d fail", link_id);
+        fota_mdm_snap_note_fail();
+        return false;
     }
-    /* last_response has e.g. "+CIPRXGET: 2,1,6,0" – parse payload length (6) */
-    if (sscanf(last_response, "+CIPRXGET: 2,%*d,%d,%d", &len, &extra) < 1) {
-        len = 64;
+    /* +CIPRXGET: 2,<link>,<this_read_len>[,<still_buffered>] — poll again while still_buffered > 0 during sized FOTA */
+    {
+        int n = sscanf(last_response, "+CIPRXGET: 2,%*d,%d,%d", &len, &unread);
+        if (n < 1) {
+            /* Do not assume 64 B on parse failure (was starving FOTA after +IP ERROR handling). */
+            len = 0;
+            unread = 0;
+        } else if (n < 2) {
+            unread = 0;
+        }
     }
-    (void)extra;
-    ESP_LOGD(TAG, "Buffered payload %d bytes (draining until OK)", len);
+    fota_mdm_snap_note_ok(len, unread);
+    if (out_unread != NULL) {
+        *out_unread = unread;
+    }
+    ESP_LOGD(TAG, "Buffered payload %d bytes (modem unread %d)", len, unread);
 
     /* Reset KA-ACK flag for this read cycle. */
     s_ka_ack_since_read = false;
@@ -364,6 +457,9 @@ static void do_read_buffered_data(int link_id) {
         while (*p == ' ' || *p == '\t') p++;
         if (p[0] == 'O' && p[1] == 'K' && (p[2] == '\0' || p[2] == ' ' || p[2] == '\t')) break;
         if (fota_session_active()) {
+            if (fota_skip_modem_line(p)) {
+                continue;
+            }
             fota_feed_modem_payload((const uint8_t *)line, payload_len);
         } else {
             size_t lead = (size_t)(p - line);
@@ -411,6 +507,47 @@ static void do_read_buffered_data(int link_id) {
         s_waiting_check_user_response = false;
         s_check_user_approved = -1;
         ESP_LOGI(TAG, "\033[1;32mUnit Ready\033[0m");
+    }
+    return true;
+}
+
+/** Max chained CIPRXGET=2 per wake (~826368/1500; cap avoids runaway). */
+#define FOTA_CIPRXGET_CHAIN_MAX 600
+/** After modem reports unread=0, TCP may still be pushing into the SIM buffer; short extra polls avoid RX window collapse mid-FOTA. */
+#define FOTA_ZERO_UNREAD_PROBE_MS   2
+#define FOTA_ZERO_UNREAD_PROBES     8
+
+/**
+ * @brief Read buffered data: AT+CIPRXGET=2,<link>, then drain payload lines until OK and pass to server_handle_incoming_line.
+ * During sized FOTA, repeats CIPRXGET while modem reports unread bytes so we do not stall on a missed +CIPRXGET:1 URC.
+ */
+static void do_read_buffered_data(int link_id) {
+    int unread = 0;
+    if (!do_read_buffered_data_once(link_id, &unread)) {
+        return;
+    }
+    for (int chain = 0;
+         fota_sized_body_incomplete() && unread > 0 && chain < FOTA_CIPRXGET_CHAIN_MAX;
+         ++chain) {
+        if (!do_read_buffered_data_once(link_id, &unread)) {
+            break;
+        }
+    }
+    /* Only when modem says nothing left buffered: TCP may still be delivering; polling avoids zero-window stalls. */
+    if (fota_sized_body_incomplete() && unread == 0) {
+        for (int probe = 0; probe < FOTA_ZERO_UNREAD_PROBES && fota_sized_body_incomplete(); ++probe) {
+            vTaskDelay(pdMS_TO_TICKS(FOTA_ZERO_UNREAD_PROBE_MS));
+            if (!do_read_buffered_data_once(link_id, &unread)) {
+                break;
+            }
+            for (int chain = 0;
+                 fota_sized_body_incomplete() && unread > 0 && chain < FOTA_CIPRXGET_CHAIN_MAX;
+                 ++chain) {
+                if (!do_read_buffered_data_once(link_id, &unread)) {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -461,8 +598,17 @@ static void server_keepalive_task(void *arg) {
 
     while (s_ka_task_running) {
         /* When waiting for ACK use shorter timeout so we detect "not ACKed" and retry sooner; else use 45 s for next KA. */
-        uint32_t wait_sec = s_ka_sent_waiting_ack ? (uint32_t)SERVER_KA_ACK_TIMEOUT_SEC : (uint32_t)SERVER_KA_INTERVAL_SEC;
-        uint32_t n = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_sec * 1000));
+        uint32_t notify_wait_ms;
+        if (fota_sized_body_incomplete()) {
+            /* Sized image: wake often; shorter transfer wall time reduces server/proxy idle disconnects. */
+            notify_wait_ms = 5u;
+        } else if (fota_session_active()) {
+            notify_wait_ms = 1000u;
+        } else {
+            uint32_t wait_sec = s_ka_sent_waiting_ack ? (uint32_t)SERVER_KA_ACK_TIMEOUT_SEC : (uint32_t)SERVER_KA_INTERVAL_SEC;
+            notify_wait_ms = wait_sec * 1000u;
+        }
+        uint32_t n = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(notify_wait_ms));
 
         if (!s_ka_task_running) break;
 
@@ -490,7 +636,8 @@ static void server_keepalive_task(void *arg) {
             continue;
         }
 
-        if (n > 0 && s_pending_read) {
+        /* Drain modem TCP buffer whenever URC set the flag — do not require n>0 (notify can be missed vs. flag). */
+        if (s_pending_read) {
             s_pending_read = false;
             do_read_buffered_data(s_pending_read_link);
             continue;
@@ -503,7 +650,7 @@ static void server_keepalive_task(void *arg) {
             s_pending_ipclose_reconnect = false;
             s_ka_sent_waiting_ack = false;
             s_ka_retry_pending = false;
-            ESP_LOGI(TAG, "Emergency: +IPCLOSE received – stopping keepalive and starting full modem re-init");
+            ESP_LOGI(TAG, "+IPCLOSE: KA stop, modem reinit");
 
             /* Stop this keepalive loop; modem_init_task will start a fresh keepalive after re-init. */
             s_ka_task_running = false;
@@ -544,8 +691,42 @@ static void server_keepalive_task(void *arg) {
         }
 
         if (fota_session_active()) {
-            /* Avoid CIPSEND keepalive while FOTA firmware is on the wire. */
-            vTaskDelay(pdMS_TO_TICKS(200));
+            /* URC +CIPRXGET:1 is easy to miss; do_read also probes after unread=0 (see FOTA_ZERO_UNREAD_*). */
+            do_read_buffered_data(s_pending_read_link);
+            if (fota_sized_body_incomplete()) {
+                TickType_t now = xTaskGetTickCount();
+                if (s_fota_trace_period_tick == 0) {
+                    s_fota_trace_period_tick = now;
+                } else if ((now - s_fota_trace_period_tick) >= pdMS_TO_TICKS(15000)) {
+                    s_fota_trace_period_tick = now;
+                    ESP_LOGI(TAG,
+                             "FOTA rx trace: rem=%lu last_CIPread_len=%d modem_unread=%d AT_last=[%s]",
+                             (unsigned long)fota_body_bytes_remaining(), s_fota_mdm_len, s_fota_mdm_unread,
+                             s_fota_mdm_snap);
+                }
+                uint32_t rem = fota_body_bytes_remaining();
+                if (rem == s_fota_stall_last_remain) {
+                    if (!s_fota_stall_timing) {
+                        s_fota_stall_since_tick = xTaskGetTickCount();
+                        s_fota_stall_timing = true;
+                    } else if ((xTaskGetTickCount() - s_fota_stall_since_tick) > pdMS_TO_TICKS(40000)) {
+                        ESP_LOGW(TAG,
+                                 "FOTA: no progress ~40s (%lu B left) — see modem snapshot on next line",
+                                 (unsigned long)rem);
+                        fota_modem_debug_log_snapshot("no_progress_40s");
+                        s_fota_stall_since_tick = xTaskGetTickCount();
+                    }
+                } else {
+                    s_fota_stall_last_remain = rem;
+                    s_fota_stall_timing = false;
+                }
+            } else {
+                s_fota_stall_last_remain = UINT32_MAX;
+                s_fota_stall_timing = false;
+                s_fota_trace_period_tick = 0;
+            }
+            uint32_t poll_ms = fota_sized_body_incomplete() ? 3u : 120u;
+            vTaskDelay(pdMS_TO_TICKS(poll_ms));
             continue;
         }
 
@@ -590,7 +771,8 @@ bool server_keepalive_task_start(void) {
         return true;
     }
     s_ka_task_running = true;
-    BaseType_t ok = xTaskCreate(server_keepalive_task, "srv_ka", 3072, NULL, 5, &s_ka_task_handle);
+    /* line[LINE_BUFFER_SIZE] in do_read_buffered_data — need headroom after LINE_BUFFER_SIZE=1600 */
+    BaseType_t ok = xTaskCreate(server_keepalive_task, "srv_ka", 8192, NULL, 5, &s_ka_task_handle);
     if (ok != pdPASS) {
         s_ka_task_running = false;
         ESP_LOGE(TAG, "Failed to create keepalive task");

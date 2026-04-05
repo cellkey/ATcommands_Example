@@ -24,6 +24,8 @@
 #include "fota_modem.h"
 #include "config_uart.h"
 #include "at_command_examples.h"
+#include "wifi_manager.h"
+#include "wifi_tcp_client.h"
 
 // Forward declaration for integration demo
 extern void start_integration_demo(void);
@@ -38,8 +40,9 @@ extern void start_tcp_examples(void);
 /////////////////////////////////////////////////////////////////////
 #define UART_BAUD_RATE        115200
 #define UART_BUF_SIZE         1024                 // Driver buffer size
-#define RX_BUFFER_SIZE        1024                 // User buffer (bursts: RING/+CLIP/+CLCC/+CGEV)
-#define LINE_BUFFER_SIZE      512                  // Must match at_command_api.h (FOTA / long URC lines)
+/* RX must hold a full binary line until \\n (OK) — 1024 was too small for 1500 B FOTA chunks. */
+#define RX_BUFFER_SIZE        4096
+/* LINE_BUFFER_SIZE from at_command_api.h */
 #define MAX_AT_COMMAND_LEN    64                   // Maximum AT command length
 #define MAX_EXPECTED_RESP_LEN 64                   // Maximum expected response length
 #define AT_TIMEOUT_MS         5000                 // AT command timeout in ms
@@ -52,8 +55,10 @@ extern void start_tcp_examples(void);
 #define MODEM_POWERUP_WAIT_MS         1200   /* was 3000; modem basic-AT retries will cover remaining boot */
 #define APPMODEM_START_DELAY_MS          0   /* was 3000; no demo delay before starting modem init */
 
-/* UART RX debug: set to 1 to dump raw bytes received from modem. */
-#define DEBUG_UART_RX_DUMP_RAW  1
+/* UART RX debug: 1 = log each read as "UART RX (ascii)" (use ESP_LOG_DEBUG for tag UART_AT).
+ * Leave 0 during FOTA — binary image bytes look like random text, flood serial, and can fill
+ * the AT response queue ("Response queue full, dropping"). */
+#define DEBUG_UART_RX_DUMP_RAW  0
 
 //static const char *TAG = "UART_AT";
 static const char *TAG = "UART_AT";
@@ -88,12 +93,22 @@ char last_matched_response[LINE_BUFFER_SIZE];
 static SemaphoreHandle_t response_ready_sem;
 
 // Response queue for handling multiple quick responses (URCs: RING, +CLIP, +CLCC, +CGEV, +CIPRXGET, etc.)
-#define RESPONSE_QUEUE_SIZE 24
+/* Bursts of TCP-as-lines (+IPD / long payloads) can fill a small queue and drop URCs/OK. */
+#define RESPONSE_QUEUE_SIZE 56
 typedef struct {
     uint16_t len;
     char data[LINE_BUFFER_SIZE];
 } modem_rsp_line_t;
 static QueueHandle_t response_queue;
+
+/* wait_for_line_containing() runs on caller task (e.g. modem_init, srv_ka) after CIPSEND — avoid ~3.2k stack. */
+static modem_rsp_line_t s_wait_line_item;
+static char s_wait_line_cstr[LINE_BUFFER_SIZE + 1];
+static SemaphoreHandle_t s_wait_line_mutex;
+
+/* Only at_command_task drains the inner AT response loop. */
+static modem_rsp_line_t s_at_dequeue_rsp;
+static char s_at_dequeue_buf[LINE_BUFFER_SIZE + 1];
 
 // Task control variables
 static TaskHandle_t modem_init_task_handle = NULL;
@@ -130,7 +145,8 @@ bool stop_modem_init_task(void);
 bool is_modem_init_active(void);
 
 /**
- * @brief Modem status LED task: GPIO15 ON during init, blink (500 ms ON / 2500 ms OFF) when connected.
+ * @brief Modem status LED task: solid ON during init; when connected, slow blink (300 / 2300 ms);
+ *        during FOTA, fast blink (300 / 300 ms).
  */
 static void modem_status_led_task(void *arg)
 {
@@ -152,6 +168,12 @@ static void modem_status_led_task(void *arg)
             /* Init / connect phase: solid ON */
             gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 1);
             vTaskDelay(pdMS_TO_TICKS(200));
+        } else if (fota_session_active()) {
+            /* FOTA in progress: fast blink */
+            gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 1);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 0);
+            vTaskDelay(pdMS_TO_TICKS(300));
         } else {
             /* Connected: blink 300 ms ON, 2300 ms OFF */
             gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 1);
@@ -212,9 +234,17 @@ static void process_rx_buffer(void) {
                 }
             }
             if (looks_text && plen < 200) {
-                ESP_LOGI(TAG, "RX Line: %s", p);
+                if (fota_session_active()) {
+                    ESP_LOGD(TAG, "RX Line: %s", p);
+                } else {
+                    ESP_LOGI(TAG, "RX Line: %s", p);
+                }
             } else {
-                ESP_LOGI(TAG, "RX chunk: %u bytes", (unsigned)plen);
+                if (fota_session_active()) {
+                    ESP_LOGD(TAG, "RX chunk: %u bytes", (unsigned)plen);
+                } else {
+                    ESP_LOGI(TAG, "RX chunk: %u bytes", (unsigned)plen);
+                }
             }
             process_line(p, plen);
         }
@@ -251,7 +281,11 @@ static void process_rx_buffer(void) {
         if (only_prompt) {
             line_buffer[0] = '>';
             line_buffer[1] = '\0';
-            ESP_LOGI(TAG, "RX Line: %s", line_buffer);
+            if (fota_session_active()) {
+                ESP_LOGD(TAG, "RX Line: %s", line_buffer);
+            } else {
+                ESP_LOGI(TAG, "RX Line: %s", line_buffer);
+            }
             process_line(line_buffer, 1);
             rx_buffer_pos = 0;
         }
@@ -346,6 +380,66 @@ static bool line_is_only_ok(const char *line) {
     return *line == '\0';
 }
 
+/** SIMCOM: AT+CIPRXGET=2 with nothing to read returns +IP ERROR: No data (not a hard failure). */
+static bool line_is_ciprxget_no_data_urc(const char *line)
+{
+    if (strstr(line, "+IP ERROR:") == NULL) {
+        return false;
+    }
+    return (strstr(line, "no data") != NULL || strstr(line, "No data") != NULL ||
+            strstr(line, "NO DATA") != NULL);
+}
+
+static bool line_is_only_error(const char *line)
+{
+    while (*line == ' ' || *line == '\t' || *line == '\r' || *line == '\n') {
+        line++;
+    }
+    return (strncmp(line, "ERROR", 5) == 0 &&
+            (line[5] == '\0' || line[5] == ' ' || line[5] == '\t'));
+}
+
+static bool line_is_fatal_at_error(const char *line)
+{
+    if (strstr(line, "FAIL") != NULL) {
+        return true;
+    }
+    if (line_is_ciprxget_no_data_urc(line)) {
+        return false;
+    }
+    return (strstr(line, "ERROR") != NULL);
+}
+
+/**
+ * After synthetic success for empty CIPRXGET=2 read, drop trailing OK/ERROR/+IP ERROR lines
+ * so the next AT command does not see a stale "ERROR".
+ */
+static void drain_trailing_ciprxget2_noise(void)
+{
+    modem_rsp_line_t d;
+    for (int k = 0; k < 8; k++) {
+        TickType_t wait = (k == 0) ? pdMS_TO_TICKS(35) : 0;
+        if (xQueueReceive(response_queue, &d, wait) != pdTRUE) {
+            return;
+        }
+        size_t n = d.len < LINE_BUFFER_SIZE - 1 ? d.len : LINE_BUFFER_SIZE - 1;
+        char buf[LINE_BUFFER_SIZE];
+        memcpy(buf, d.data, n);
+        buf[n] = '\0';
+        char *p = buf;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            p++;
+        }
+        if (line_is_only_ok(p) || line_is_only_error(p) || line_is_ciprxget_no_data_urc(p)) {
+            continue;
+        }
+        if (xQueueSend(response_queue, &d, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "CIPRXGET=2 drain: queue full, dropping restored line");
+        }
+        return;
+    }
+}
+
 static void log_uart_rx_ascii(const uint8_t *data, int len)
 {
     if (!data || len <= 0) return;
@@ -373,7 +467,7 @@ static void log_uart_rx_ascii(const uint8_t *data, int len)
         out[n++] = '.';
     }
     out[n] = '\0';
-    ESP_LOGI(TAG, "UART RX (ascii): %s", out);
+    ESP_LOGD(TAG, "UART RX (ascii): %s", out);
 }
 //wait for modem startup URCs before sending first AT
 static bool wait_for_modem_boot_urcs(uint32_t timeout_ms)
@@ -408,7 +502,11 @@ static void uart_rx_task(void *arg) {
         int len = uart_read_bytes(UART_NUM, data, sizeof(data), pdMS_TO_TICKS(100));
         if (len > 0) {
             rx_idle_count = 0; // Reset idle counter
-            ESP_LOGI(TAG, "UART RX: Got %d bytes", len);
+            if (fota_session_active()) {
+                ESP_LOGD(TAG, "UART RX: Got %d bytes", len);
+            } else {
+                ESP_LOGI(TAG, "UART RX: Got %d bytes", len);
+            }
             
             /* Optional: log raw bytes (ASCII view) for UART debug (helps detect URCs/OK). */
 #if DEBUG_UART_RX_DUMP_RAW
@@ -456,7 +554,11 @@ static void at_command_task(void *arg) {
     while (1) {
         // Wait for AT command in queue
         if (xQueueReceive(at_command_queue, &cmd, portMAX_DELAY) == pdTRUE) {
-            ESP_LOGI(TAG, "Processing AT command: %s", cmd.command);
+            if (fota_session_active()) {
+                ESP_LOGD(TAG, "Processing AT command: %s", cmd.command);
+            } else {
+                ESP_LOGI(TAG, "Processing AT command: %s", cmd.command);
+            }
             
             // Take UART mutex
             if (xSemaphoreTake(uart_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -467,7 +569,11 @@ static void at_command_task(void *arg) {
                 int tx_bytes = uart_write_bytes(UART_NUM, cmd.command, strlen(cmd.command));
                 uart_write_bytes(UART_NUM, "\r\n", 2);
                 
-                ESP_LOGI(TAG, "Sent: %s (TX bytes: %d)", cmd.command, tx_bytes);
+                if (fota_session_active()) {
+                    ESP_LOGD(TAG, "Sent: %s (TX bytes: %d)", cmd.command, tx_bytes);
+                } else {
+                    ESP_LOGI(TAG, "Sent: %s (TX bytes: %d)", cmd.command, tx_bytes);
+                }
                 
                 // Flush TX to ensure data is sent immediately
                 uart_wait_tx_done(UART_NUM, pdMS_TO_TICKS(100));
@@ -486,29 +592,41 @@ static void at_command_task(void *arg) {
                 while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
                     if (xSemaphoreTake(response_ready_sem, pdMS_TO_TICKS(100)) == pdTRUE) {
                         // Process all available responses in the queue
-                        modem_rsp_line_t rsp;
-                        char current_response[LINE_BUFFER_SIZE + 1];
-                        while (xQueueReceive(response_queue, &rsp, 0) == pdTRUE) {
-                            size_t cn = rsp.len < LINE_BUFFER_SIZE ? rsp.len : LINE_BUFFER_SIZE;
-                            memcpy(current_response, rsp.data, cn);
-                            current_response[cn] = '\0';
-                            ESP_LOGD(TAG, "AT response (%u bytes)", (unsigned)rsp.len);
-                            // Check for error responses first (always priority)
-                            if (strstr(current_response, "ERROR") != NULL ||
-                                strstr(current_response, "FAIL") != NULL) {
+                        while (xQueueReceive(response_queue, &s_at_dequeue_rsp, 0) == pdTRUE) {
+                            size_t cn = s_at_dequeue_rsp.len < LINE_BUFFER_SIZE ? s_at_dequeue_rsp.len : LINE_BUFFER_SIZE;
+                            memcpy(s_at_dequeue_buf, s_at_dequeue_rsp.data, cn);
+                            s_at_dequeue_buf[cn] = '\0';
+                            ESP_LOGD(TAG, "AT response (%u bytes)", (unsigned)s_at_dequeue_rsp.len);
+                            /* CIPRXGET=2 poll: empty modem buffer → +IP ERROR: No data (or bare ERROR). */
+                            if (expect_data && strncmp(cmd.command, "AT+CIPRXGET=2,", 14) == 0) {
+                                if (line_is_ciprxget_no_data_urc(s_at_dequeue_buf) ||
+                                    line_is_only_error(s_at_dequeue_buf)) {
+                                    int cip_lk = 1;
+                                    (void)sscanf(cmd.command, "AT+CIPRXGET=2,%d", &cip_lk);
+                                    snprintf(last_response, sizeof(last_response),
+                                             "+CIPRXGET: 2,%d,0,0", cip_lk);
+                                    snprintf(last_matched_response, sizeof(last_matched_response), "%s",
+                                             last_response);
+                                    *cmd.result = AT_RESULT_SUCCESS;
+                                    ESP_LOGD(TAG, "CIPRXGET=2: no data in buffer (retry later)");
+                                    drain_trailing_ciprxget2_noise();
+                                    goto command_complete;
+                                }
+                            }
+                            if (line_is_fatal_at_error(s_at_dequeue_buf)) {
                                 *cmd.result = AT_RESULT_ERROR;
-                                ESP_LOGW(TAG, "AT command ERROR: %s", current_response);
+                                ESP_LOGW(TAG, "AT command ERROR: %s", s_at_dequeue_buf);
                                 goto command_complete;
                             }
 
                             // Phase 1: Check for expected data response (if expected)
-                            if (expect_data && !data_received && response_matches(current_response, cmd.expected_response)) {
+                            if (expect_data && !data_received && response_matches(s_at_dequeue_buf, cmd.expected_response)) {
                                 data_received = true;
-                                memcpy(last_response, rsp.data, cn);
+                                memcpy(last_response, s_at_dequeue_rsp.data, cn);
                                 last_response[cn] = '\0';
-                                memcpy(last_matched_response, rsp.data, cn);
+                                memcpy(last_matched_response, s_at_dequeue_rsp.data, cn);
                                 last_matched_response[cn] = '\0';
-                                ESP_LOGD(TAG, "Data response received (%u bytes)", (unsigned)rsp.len);
+                                ESP_LOGD(TAG, "Data response received (%u bytes)", (unsigned)s_at_dequeue_rsp.len);
                                 
                                 // If we don't need to wait for OK, we're done
                                 if (!cmd.wait_for_ok) {
@@ -522,7 +640,7 @@ static void at_command_task(void *arg) {
                             
                             // Phase 2: Check for OK response (only if wait_for_ok is true).
                             // Use exact "OK" line match so "HTTP/1.1 200 OK" is not consumed as AT OK.
-                            if (cmd.wait_for_ok && line_is_only_ok(current_response)) {
+                            if (cmd.wait_for_ok && line_is_only_ok(s_at_dequeue_buf)) {
                                 if (expect_data) {
                                     // For data commands: need both data AND OK
                                     if (data_received) {
@@ -543,14 +661,14 @@ static void at_command_task(void *arg) {
                             // Handle case where expected_response is "OK" directly (exact line only)
                             if (!expect_data && cmd.expected_response[0] != '\0' && 
                                 strcmp(cmd.expected_response, "OK") == 0 && 
-                                line_is_only_ok(current_response)) {
+                                line_is_only_ok(s_at_dequeue_buf)) {
                                 *cmd.result = AT_RESULT_SUCCESS;
                                // ESP_LOGI(TAG, "AT command SUCCESS: Expected and got OK");
                                 goto command_complete;
                             }
                             
                             // Log unmatched responses for debugging
-                            ESP_LOGD(TAG, "Response '%s' didn't match any expected pattern", current_response);
+                            ESP_LOGD(TAG, "Response '%s' didn't match any expected pattern", s_at_dequeue_buf);
                         }
                     }
                 }
@@ -633,23 +751,32 @@ at_result_t send_at_command(const char *command, const char *expected_response, 
  * @brief Wait for a line containing substr from modem (e.g. "200 OK"). Call when no AT command is in progress.
  */
 at_result_t wait_for_line_containing(const char *substr, uint32_t timeout_ms) {
-    modem_rsp_line_t item;
+    if (s_wait_line_mutex == NULL) {
+        ESP_LOGE(TAG, "wait_for_line: mutex not initialized");
+        return AT_RESULT_ERROR;
+    }
+    if (xSemaphoreTake(s_wait_line_mutex, portMAX_DELAY) != pdTRUE) {
+        return AT_RESULT_ERROR;
+    }
+    at_result_t out = AT_RESULT_TIMEOUT;
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
     while ((xTaskGetTickCount() - start) < timeout_ticks) {
-        if (xQueueReceive(response_queue, &item, pdMS_TO_TICKS(200)) == pdTRUE) {
-            size_t n = item.len < LINE_BUFFER_SIZE ? item.len : LINE_BUFFER_SIZE;
-            /* NUL for strstr only; binary lines rarely contain substr. */
-            char buffer[LINE_BUFFER_SIZE + 1];
-            memcpy(buffer, item.data, n);
-            buffer[n] = '\0';
-            if (strstr(buffer, substr) != NULL) {
-                return AT_RESULT_SUCCESS;
+        if (xQueueReceive(response_queue, &s_wait_line_item, pdMS_TO_TICKS(200)) == pdTRUE) {
+            size_t n = s_wait_line_item.len < LINE_BUFFER_SIZE ? s_wait_line_item.len : LINE_BUFFER_SIZE;
+            memcpy(s_wait_line_cstr, s_wait_line_item.data, n);
+            s_wait_line_cstr[n] = '\0';
+            if (strstr(s_wait_line_cstr, substr) != NULL) {
+                out = AT_RESULT_SUCCESS;
+                break;
             }
         }
     }
-    ESP_LOGW(TAG, "wait_for_line: timeout waiting for '%s'", substr);
-    return AT_RESULT_TIMEOUT;
+    if (out != AT_RESULT_SUCCESS) {
+        ESP_LOGW(TAG, "wait_for_line: timeout waiting for '%s'", substr);
+    }
+    xSemaphoreGive(s_wait_line_mutex);
+    return out;
 }
 
 /**
@@ -1060,7 +1187,7 @@ bool start_modem_init_task(void) {
 
         modem_init_task,
         "modem_init_task",
-        4096,
+        12288,
         NULL,
         9,  // Higher priority than demo task
         &modem_init_task_handle
@@ -1129,66 +1256,50 @@ void app_main(void) {
     esp_log_level_set("CFG_UART", ESP_LOG_WARN);     /* config shell prints its own banner/prompt */
     esp_log_level_set("MODEM_EXAMPLE", ESP_LOG_WARN);/* hide demo helper info logs */
 
-    /* Ensure modem power switch (active-low) is OFF immediately at boot:
-     * GPIO12 HIGH = modem supply disabled. This avoids the modem powering
-     * up before UART/firmware are ready to listen for its first URCs.
-     */
-    gpio_reset_pin(A7670E_MODEM_PWR_GPIO);
-    gpio_set_direction(A7670E_MODEM_PWR_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);  /* OFF */
-
-    /* NVS for BLE controller and unit config: active keys are unit_id and status_reg. */
+    /* NVS: init first so status_reg can gate modem GPIO and tasks below. */
     esp_err_t nvs = nvs_flash_init();
     if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
     nvs_config_init();
-    /* If unit_id key is empty, write default so it can be changed later via SET unit_id=... */
     nvs_config_ensure_unit_id_default(A7670E_UNIT_ID);
+
+    /* status_reg bit 4 (0x0010) = modem ENABLED.
+     * Default 0x0000 → WiFi-only (safe when modem hardware not assembled).
+     * Enable modem:    SET status_reg=0x0010  then  REBOOT.
+     * Disable modem:   SET status_reg=0x0000  then  REBOOT.            */
+    #define STATUS_ENABLE_MODEM    0x0010
+    uint16_t early_sr       = nvs_config_get_status_reg(0x0000);
+    bool     modem_disabled = (early_sr & STATUS_ENABLE_MODEM) == 0;   /* bit CLEAR = no modem */
+
+    if (modem_disabled) {
+        ESP_LOGW(TAG, "*** WiFi-only mode (status_reg=0x%04X, bit4 clear) – modem UART/GPIO/tasks skipped ***", early_sr);
+    } else {
+        /* Keep modem supply OFF until UART/firmware are ready. GPIO12 active-low: HIGH = off. */
+        gpio_reset_pin(A7670E_MODEM_PWR_GPIO);
+        gpio_set_direction(A7670E_MODEM_PWR_GPIO, GPIO_MODE_OUTPUT);
+        gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);
+    }
+
+    /* WiFi: only when modem is disabled (bit4 clear = WiFi-only mode).
+     * When modem is active WiFi is fully skipped — site-specific credentials
+     * won't be configured on modem deployments.
+     * Future: STATUS_MODEM_SLAVE (0x0030) will re-enable WiFi alongside modem
+     *         for voice/ring-only modem + WiFi data path. */
+    if (modem_disabled) {
+        wifi_manager_init();
+        wifi_tcp_client_start();
+    }
 
     /* After OTA: confirm image so bootloader rollback does not revert on next reset. */
     fota_mark_current_app_valid_if_needed();
 
-    /* Status register: read from NVS and check mode bits (ready for mode logic implementation). */
-    {
-        uint16_t status_reg = nvs_config_get_status_reg(0x0000);  // default 0x0000 if not set
-        
-        /* Example bit masks (define your own based on mode requirements):
-         *  - Bits 0-1 (0x0001/0x0002) are reserved for KEEPOPEN relay state (STATUS_KEEP_RELAY1/2 in nvs_config.h).
-         *  - Higher bits can be used for mode/factory/maintenance flags.
-         */
-        //RE DEFINITIONS NEEDED..!!!
-        #define STATUS_MODE_MASK       0x000C  /* bits 2-3: mode (0=normal, 1=config, 2=maintenance, 3=reserved) */
-        #define STATUS_FACTORY_MASK    0x0000  /* bit 4: factory reset flag */
-        #define STATUS_MAINTENANCE     0x0020  /* bit 5: maintenance mode */
-        #define STATUS_DISABLE_MODEM   0x0040  /* bit 6: disable modem init */
-        #define STATUS_DISABLE_BLE     0x0080  /* bit 7: disable BLE */
-        
-        ESP_LOGI(TAG, "Status register: 0x%04X", status_reg);
-        
-        /* Check bits and log mode (ready to implement mode-specific logic): */
-        if (status_reg & STATUS_FACTORY_MASK) {
-            ESP_LOGI(TAG, "Status: Factory reset mode");
-            // TODO: implement factory reset logic
-        }
-        if (status_reg & STATUS_MAINTENANCE) {
-            ESP_LOGI(TAG, "Status: Maintenance mode");
-            // TODO: skip normal init, go to config/maintenance mode
-        }
-        uint8_t mode = status_reg & STATUS_MODE_MASK;
-        ESP_LOGI(TAG, "Status: Mode bits = %d (0=normal, 1=config, 2=maintenance)", mode);
-        
-        /* Example: conditional init based on status bits (ready to enable): */
-        // if (status_reg & STATUS_DISABLE_MODEM) {
-        //     ESP_LOGI(TAG, "Status: Modem init disabled");
-        //     // Skip modem init
-        // }
-        // if (status_reg & STATUS_DISABLE_BLE) {
-        //     ESP_LOGI(TAG, "Status: BLE init disabled");
-        //     // Skip BLE init
-        // }
-    }
+    /* status_reg bit map: 0-1=KEEPOPEN relay, 4=disable modem (WiFi-only), higher bits=future use. */
+    ESP_LOGI(TAG, "Status register: 0x%04X  modem=%s  wifi=%s",
+             early_sr,
+             modem_disabled                   ? "OFF" : "ON",
+             wifi_manager_is_connected()      ? "connected" : "starting");
 
     /* 1) Relay first (shared by modem OPEN, BLE app, and CHECK_USER flow). */
     if (relay_control_init() != ESP_OK || relay_control_start() != ESP_OK) {
@@ -1236,84 +1347,69 @@ void app_main(void) {
     if (esp_task_wdt_init(&wdt_cfg) != ESP_OK) {
         ESP_LOGW(TAG, "Task WDT init failed (may already be inited)");
     } else {
-        ESP_LOGI(TAG, "Task WDT: %d s, panic=true (fed by uart_rx + BLE status_led)", (int)WATCHDOG_TIMEOUT_SECONDS);
+        ESP_LOGI(TAG, "Task WDT: %d s, panic=true (fed by %s + BLE status_led)",
+                 (int)WATCHDOG_TIMEOUT_SECONDS, modem_disabled ? "wifi tasks" : "uart_rx");
     }
 
-    // Create synchronization objects
-    at_command_queue = xQueueCreate(AT_QUEUE_SIZE, sizeof(at_command_t));
-    uart_mutex = xSemaphoreCreateMutex();
-    response_ready_sem = xSemaphoreCreateBinary();
-    init_control_mutex = xSemaphoreCreateMutex();
-    response_queue = xQueueCreate(RESPONSE_QUEUE_SIZE, sizeof(modem_rsp_line_t));
-    
-    if (at_command_queue == NULL || uart_mutex == NULL || response_ready_sem == NULL || 
-        init_control_mutex == NULL || response_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create synchronization objects");
-        return;
+    if (!modem_disabled) {
+        /* ── Modem sync objects ─────────────────────────────────────────── */
+        at_command_queue   = xQueueCreate(AT_QUEUE_SIZE, sizeof(at_command_t));
+        uart_mutex         = xSemaphoreCreateMutex();
+        response_ready_sem = xSemaphoreCreateBinary();
+        init_control_mutex = xSemaphoreCreateMutex();
+        response_queue     = xQueueCreate(RESPONSE_QUEUE_SIZE, sizeof(modem_rsp_line_t));
+        s_wait_line_mutex  = xSemaphoreCreateMutex();
+
+        if (at_command_queue == NULL || uart_mutex == NULL || response_ready_sem == NULL ||
+            init_control_mutex == NULL || response_queue == NULL || s_wait_line_mutex == NULL) {
+            ESP_LOGE(TAG, "Failed to create modem synchronization objects");
+            return;
+        }
+
+        /* ── Modem UART ─────────────────────────────────────────────────── */
+        uart_config_t uart_config = {
+            .baud_rate = UART_BAUD_RATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity    = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        };
+        ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
+        ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+        ESP_ERROR_CHECK(uart_driver_install(UART_NUM, UART_BUF_SIZE, 0, 0, NULL, 0));
+
+        /* ── Modem tasks ────────────────────────────────────────────────── */
+        xTaskCreate(uart_rx_task, "uart_rx_task", 6144, NULL, 12, NULL);
+        /* Large LINE_BUFFER_SIZE: s_at_dequeue_* statics are big; keep stack generous. */
+        xTaskCreate(at_command_task, "at_command_task", 12288, NULL, 10, NULL);
+        if (modem_status_led_task_handle == NULL) {
+            xTaskCreate(modem_status_led_task, "modem_status_led", 2048, NULL, 4, &modem_status_led_task_handle);
+        }
+    } else {
+        ESP_LOGI(TAG, "WiFi-only: modem queues / UART / tasks not created");
     }
-   ////////////////////// UART configuration///////////////////// 
-    
-    uart_config_t uart_config = {
-        .baud_rate = UART_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-    };
-    
-    // Configure UART parameters
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    
-    // Install UART driver with RX interrupt and buffer
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, UART_BUF_SIZE, 0, 0, NULL, 0));
-   ///////////////////////////////////////////////////////////// 
-   
-    // Create permanent tasks
-    xTaskCreate(uart_rx_task, "uart_rx_task", 3072, NULL, 12, NULL);
-    xTaskCreate(at_command_task, "at_command_task", 4096, NULL, 10, NULL);
-    if (modem_status_led_task_handle == NULL) {
-        xTaskCreate(modem_status_led_task, "modem_status_led", 2048, NULL, 4, &modem_status_led_task_handle);
-    }
-    /* Local button task: GPIO15 active-low → relay pulse. */
+
+    /* Local button: GPIO15 active-low → relay pulse. Not modem-specific; always active. */
     if (local_button_task_handle == NULL) {
         xTaskCreate(local_button_task, "local_button", 2048, NULL, 5, &local_button_task_handle);
     }
-    //  xTaskCreate(demo_task, "demo_task", 3072, NULL, 8, &demo_task_handle);  
-    // Note: modem_init_task is created on-demand using start_modem_init_task()
+    /* Note: modem_init_task is created on-demand via start_modem_init_task() */
 
     /* Config shell on console (same UART as monitor): SET/GET unit_id and status_reg. */
     if (!config_uart_start()) {
         ESP_LOGW(TAG, "Config shell not started (optional)");
     }
 
-    ESP_LOGI(TAG, "UART AT Command System initialized successfully");
-    // ESP_LOGI(TAG, "- UART: Port %d, TX: GPIO%d, RX: GPIO%d, Baud: %d", 
-    //          UART_NUM, UART_TX_PIN, UART_RX_PIN, UART_BAUD_RATE);
-    // ESP_LOGI(TAG, "- AT Command Queue Size: %d", AT_QUEUE_SIZE);
-    // ESP_LOGI(TAG, "- Default AT Timeout: %d ms", AT_TIMEOUT_MS);
-    ESP_LOGI(TAG, "- Modem init task: Use start_modem_init_task() to activate");
-    
-    // Demonstrate the task control system
+    if (modem_disabled) {
+        ESP_LOGI(TAG, "System ready – WiFi-only mode (modem disabled)");
+    } else {
+        ESP_LOGI(TAG, "System ready – modem + WiFi mode");
+    }
+
     vTaskDelay(pdMS_TO_TICKS(APPMODEM_START_DELAY_MS));
-    ESP_LOGD(TAG, "System ready - you can now use the AT command examples");
-    ESP_LOGD(TAG, "Include 'integration_example.c' and call start_integration_demo() to see examples");
-    
-    // Uncomment the line below to automatically run the integration demo:
-   //  start_integration_demo(); //located at <integration_example.c>
-//==========================================================================
-    // Uncomment the line below to automatically run the modem init options examples:
-    // code in file: modem_init_usage_example.c
 
-
-    /* Start modem only if not disabled by status_reg (bit 4). Use SET status_reg=0x0010 then REBOOT to disable modem when not assembled. */
-    {
-        uint16_t sr = nvs_config_get_status_reg(0x0000);
-        if (sr & 0x0010) {  /* STATUS_DISABLE_MODEM bit high means modem init is disabled */
-            ESP_LOGI(TAG, "Modem init disabled by status_reg (bit 4) – skipping start_modem_init()");
-        } else {
-            start_modem_init();
-        }
+    if (!modem_disabled) {
+        start_modem_init();
     }
   //======================================================================= 
     // Uncomment the line below to automatically run the TCP/IP task examples:

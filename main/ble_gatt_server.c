@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include "ble_gatt_server.h"
 #include "a7670e_config.h"
+#include "wifi_manager.h"   /* wifi_manager_is_connected() — LED priority */
 #include "nvs_config.h"
 #include "relay_control.h"
 #include "encryption.h"
@@ -138,6 +139,12 @@ static void status_led_task(void *arg)
 
     while (1) {
         esp_task_wdt_reset();
+        /* WiFi has LED priority when connected to local network or server.
+         * Yield the GPIO to wifi_status_led_task for the full blink interval. */
+        if (wifi_manager_is_connected()) {
+            vTaskDelay(pdMS_TO_TICKS(STATUS_LED_BLINK_MS));
+            continue;
+        }
         if (is_connected) {
             status_led_state = true;
 #ifdef STATUS_LED_ACTIVE_LOW

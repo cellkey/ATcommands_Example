@@ -239,7 +239,7 @@ static void update_relay_timers(void)
             relay_status[i].is_active = false;
             relay_status[i].remaining_ms = 0;
             active_relays[i].is_timed = false;
-            ESP_LOGI(TAG, "Relay %d auto-off after %ums", i + 1, (unsigned)elapsed_ms);
+          //  ESP_LOGI(TAG, "Relay %d auto-off after %ums", i + 1, (unsigned)elapsed_ms);
         } else {
             relay_status[i].remaining_ms = active_relays[i].command.duration_ms - elapsed_ms;
         }
@@ -274,7 +274,7 @@ static void relay_task(void *arg)
                             relay_status[idx].remaining_ms = 0;
                         }
                     }
-                    ESP_LOGI(TAG, "Both relays ON %ums", (unsigned)cmd.duration_ms);
+                    ESP_LOGI(TAG, "Both relays ON for %ums", (unsigned)cmd.duration_ms);
                 } else if (cmd.relay_number >= 1 && cmd.relay_number <= MAX_RELAYS) {
                     int idx = cmd.relay_number - 1;
                     set_relay_state(cmd.relay_number, true);
