@@ -39,12 +39,15 @@ extern "C" {
 
 /** Compile-time default credentials — used when NVS keys wifi_ssid / wifi_pass are not set.
  *  NVS always wins if present.  Override at runtime via config shell:
- *    SET wifi_ssid=<name>   SET wifi_pass=<pass>   REBOOT              */
+ *    SET wifi_ssid=<name>   SET wifi_pass=<pass>   REBOOT
+ *  If NVS SSID is missing from scan, firmware may connect using these defaults at runtime only;
+ *  NVS is not overwritten, so the preferred SSID is tried again on the next boot when visible. */
 //#define WIFI_DEFAULT_SSID    "Gross_home"  //change to your actual wifi ssid
 //#define WIFI_DEFAULT_PASS    "avivaaviva1" //change to your actual wifi password
-#define WIFI_DEFAULT_SSID    "CREACELL"     /* must match beacon case (scan log) */
-#define WIFI_DEFAULT_PASS    "creacell2018" //Creacell Slocal wifi password
-
+//#define WIFI_DEFAULT_SSID    "CREACELL"     /* must match beacon case (scan log) */
+//#define WIFI_DEFAULT_PASS    "creacell2018" //Creacell Slocal wifi password
+#define WIFI_DEFAULT_SSID    "south up guest"    //south up Slocal wifi password
+#define WIFI_DEFAULT_PASS    ""                 //south up Slocal wifi password
 /** Status LED GPIO (active-high, GPIO23).
  *  Steady ON          → not connected to local network
  *  Blink 500 / 500 ms → connected to local network (no server yet)
@@ -61,9 +64,19 @@ extern "C" {
 #define WIFI_WPS_BUTTON_GPIO  15
 #endif
 
-/** Router WPS window; after this, fall back to normal scan + saved SSID. */
+/** Max WPS wait before fallback (enforced in firmware via esp_timer; IDF WPS stack stays 120s internally). */
 #ifndef WIFI_WPS_TIMEOUT_S
-#define WIFI_WPS_TIMEOUT_S    120
+#define WIFI_WPS_TIMEOUT_S    30
+#endif
+
+/**
+ * After configuring the WPS GPIO, if the line is still HIGH, poll up to this many ms for LOW
+ * (10 ms steps). Helps reset+tact timing and pin settle vs reading tact once. Same pin as the
+ * relay local_button task, but that task starts later and uses edge detect — WPS only runs here.
+ * Adds up to this delay on every boot when tact is not pressed; set to 0 for fastest boot.
+ */
+#ifndef WIFI_WPS_BOOT_GRACE_MS
+#define WIFI_WPS_BOOT_GRACE_MS  200
 #endif
 
 /** Connection state visible to the rest of the application. */
@@ -83,6 +96,12 @@ typedef enum {
  * @return false if no SSID is configured or init failed (WiFi not started).
  */
 bool wifi_manager_init(void);
+
+/**
+ * @brief True while boot WPS is in progress: tact was held at init until success, fail, or timeout.
+ *        Use for user-facing logs (e.g. after app_main "ready" banner).
+ */
+bool wifi_manager_wps_boot_pending(void);
 
 /**
  * @brief Returns true when WiFi is connected and the device has an IP address.

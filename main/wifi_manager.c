@@ -7,9 +7,14 @@
  *   2. WIFI_EVENT_STA_START →  esp_wifi_connect()
  *   3. IP_EVENT_STA_GOT_IP  →  state = CONNECTED, stores IP string
  *   4. WIFI_EVENT_STA_DISCONNECTED → state = DISCONNECTED, schedules 5-s retry via esp_timer
- *   5. Timer fires → esp_wifi_connect()  (loop back to step 3 on success)
+ *   5. Timer fires → esp_wifi_connect(), or full scan first if last disconnect was
+ *      NO_AP_FOUND / BEACON_TIMEOUT (BLE coexist / stale BSSID).
  *
- *   On first STA start: passive/active scan → log visible APs → then connect.
+ *   On first STA start: passive/active scan → log visible APs → if profile SSID missing,
+ *   fall back to WIFI_DEFAULT_* in the STA config only (NVS wifi_ssid unchanged so preferred
+ *   SSID is retried next boot when it reappears); if still missing, skip connect and rescan in 5 s.
+ *   Note: esp_wifi_scan_get_ap_records() clears the driver scan list — one fetch per SCAN_DONE,
+ *   shared for log + fallback + open BSSID pin + SSID presence (do not call get_ap_records twice).
  *
  *   WPS at boot: GPIO must read LOW at init (then short debounce). If idle HIGH, no delay.
  *   Press the router WPS button. On success, SSID/pass saved to NVS; on timeout,
@@ -39,8 +44,12 @@ static volatile wifi_mgr_state_t s_state           = WIFI_MGR_STATE_IDLE;
 static volatile bool             s_server_connected = false;
 static char                      s_ip_str[16]      = {0};   /* "xxx.xxx.xxx.xxx\0" */
 static esp_timer_handle_t        s_reconnect_timer  = NULL;
-/** After first boot scan completes, reconnects skip scanning. */
+/** One-shot: enforce WIFI_WPS_TIMEOUT_S (IDF supplicant ignores esp_wifi_wps_start(ms), uses 120s). */
+static esp_timer_handle_t        s_wps_cap_timer    = NULL;
+/** After first boot scan completes, reconnects skip scanning unless s_reconnect_scan_first. */
 static bool                      s_scan_before_connect_done = false;
+/** Set on BEACON_TIMEOUT / NO_AP_FOUND so next reconnect does a full scan (BLE coexist, stale BSSID). */
+static volatile bool             s_reconnect_scan_first     = false;
 /** Tact held at boot → run WPS PBC once after STA_START. */
 static bool                      s_wps_boot_requested       = false;
 /** True between esp_wifi_wps_start() and esp_wifi_wps_disable(). */
@@ -64,7 +73,12 @@ static bool wps_button_held_at_boot(void)
     if (gpio_config(&io) != ESP_OK) {
         return false;
     }
-    /* Idle (not pressed) = HIGH → no debounce delay, no WPS. */
+#if WIFI_WPS_BOOT_GRACE_MS > 0
+    for (int w = 0; w < WIFI_WPS_BOOT_GRACE_MS && gpio_get_level(WIFI_WPS_BUTTON_GPIO) != 0; w += 10) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+#endif
+    /* Not pressed (HIGH) → no WPS. */
     if (gpio_get_level(WIFI_WPS_BUTTON_GPIO) != 0) {
         return false;
     }
@@ -86,7 +100,7 @@ static bool wps_button_held_at_boot(void)
  * - ALL_CHANNEL_SCAN + sort by RSSI: same SSID on several BSSIDs/channels (guest meshes).
  * - failure_retry_cnt: try next matching AP after failures (requires all-channel scan).
  * - Open password: owe_enabled 0 here; after scan we set owe per BSS (OPEN vs OWE) in
- *   open_pick_bssid_from_scan_results().
+ *   open_pick_bssid_from_scan_buf() on that same buffer.
  */
 static void sta_apply_connect_policy(wifi_config_t *wc)
 {
@@ -113,24 +127,9 @@ static void sta_apply_connect_policy(wifi_config_t *wc)
  * After a full scan, bind STA to the strongest OPEN or OWE BSS for s_profile_ssid.
  * Mitigates 210 when the same SSID is also broadcast encrypted (empty password vs WPA beacon).
  */
-static bool open_pick_bssid_from_scan_results(void)
+static bool open_pick_bssid_from_scan_buf(const wifi_ap_record_t *rec, uint16_t cnt)
 {
-    if (!s_profile_open || s_profile_ssid[0] == '\0') {
-        return false;
-    }
-
-    uint16_t n = 0;
-    if (esp_wifi_scan_get_ap_num(&n) != ESP_OK || n == 0) {
-        return false;
-    }
-
-    wifi_ap_record_t *rec = (wifi_ap_record_t *)calloc(n, sizeof(wifi_ap_record_t));
-    if (!rec) {
-        return false;
-    }
-    uint16_t cnt = n;
-    if (esp_wifi_scan_get_ap_records(&cnt, rec) != ESP_OK) {
-        free(rec);
+    if (!rec || cnt == 0 || !s_profile_open || s_profile_ssid[0] == '\0') {
         return false;
     }
 
@@ -152,17 +151,15 @@ static bool open_pick_bssid_from_scan_results(void)
     if (best_i < 0) {
         ESP_LOGW(TAG, "Open profile: no OPEN/OWE BSS for \"%s\" in scan — may get 210 if SSID is mixed",
                  s_profile_ssid);
-        free(rec);
         return false;
     }
 
     wifi_config_t wc = {0};
     if (esp_wifi_get_config(WIFI_IF_STA, &wc) != ESP_OK) {
-        free(rec);
         return false;
     }
 
-    wifi_ap_record_t *ap = &rec[best_i];
+    const wifi_ap_record_t *ap = &rec[best_i];
     wc.sta.bssid_set = true;
     memcpy(wc.sta.bssid, ap->bssid, 6);
     wc.sta.channel   = ap->primary;
@@ -170,7 +167,6 @@ static bool open_pick_bssid_from_scan_results(void)
     wc.sta.owe_enabled = (ap->authmode == WIFI_AUTH_OWE) ? 1 : 0;
 
     esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
-    free(rec);
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "open BSSID pin: esp_wifi_set_config: %s", esp_err_to_name(e));
         return false;
@@ -184,14 +180,15 @@ static bool open_pick_bssid_from_scan_results(void)
 
 static wifi_scan_config_t default_scan_config(void)
 {
+    /* active min/max = 0 → driver defaults; required when BT/BLE is on (coexistence). */
     wifi_scan_config_t sc = {
         .ssid        = NULL,
         .bssid       = NULL,
         .channel     = 0,
         .show_hidden = true,
         .scan_type   = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300,
+        .scan_time.active.min = 0,
+        .scan_time.active.max = 0,
     };
     return sc;
 }
@@ -210,8 +207,19 @@ static void wps_save_credentials_to_nvs(const wifi_config_t *wc)
     (void)nvs_config_set_string(NVS_KEY_WIFI_PASS, pass[0] ? pass : "");
 }
 
+static void wps_cap_timer_stop(void)
+{
+    if (s_wps_cap_timer != NULL) {
+        esp_timer_stop(s_wps_cap_timer);
+    }
+}
+
 static void wps_abort_fallback_scan(void)
 {
+    wps_cap_timer_stop();
+    if (!s_wps_session_active && !s_wps_boot_requested) {
+        return;
+    }
     s_wps_session_active = false;
     s_wps_boot_requested = false;
     esp_err_t e = esp_wifi_wps_disable();
@@ -228,8 +236,19 @@ static void wps_abort_fallback_scan(void)
     }
 }
 
+static void wps_cap_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!s_wps_session_active) {
+        return;
+    }
+    ESP_LOGW(TAG, "WPS timeout (%ds) — falling back to saved Wi-Fi", WIFI_WPS_TIMEOUT_S);
+    wps_abort_fallback_scan();
+}
+
 static void wps_handle_success(void *event_data)
 {
+    wps_cap_timer_stop();
     s_wps_session_active = false;
     s_wps_boot_requested = false;
 
@@ -309,31 +328,48 @@ static const char *disconnect_reason_str(wifi_err_reason_t r)
     }
 }
 
-static void log_scan_results(void)
+/**
+ * One esp_wifi_scan_get_ap_records() per scan — IDF clears internal list after it.
+ * Caller must free() the returned buffer.
+ */
+static wifi_ap_record_t *scan_results_take(uint16_t *out_count)
 {
     uint16_t n = 0;
-    if (esp_wifi_scan_get_ap_num(&n) != ESP_OK) {
-        ESP_LOGW(TAG, "Scan: get_ap_num failed");
-        return;
+    if (esp_wifi_scan_get_ap_num(&n) != ESP_OK || n == 0) {
+        if (out_count) {
+            *out_count = 0;
+        }
+        return NULL;
     }
-    if (n == 0) {
-        ESP_LOGW(TAG, "Scan: 0 APs (check antenna / band — office may be 5 GHz only)");
-        return;
-    }
-
     wifi_ap_record_t *rec = (wifi_ap_record_t *)calloc(n, sizeof(wifi_ap_record_t));
     if (!rec) {
         ESP_LOGE(TAG, "Scan: OOM for %u AP record(s)", (unsigned)n);
-        return;
+        if (out_count) {
+            *out_count = 0;
+        }
+        return NULL;
     }
-    uint16_t count = n;
-    esp_err_t err = esp_wifi_scan_get_ap_records(&count, rec);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Scan: get_ap_records: %s", esp_err_to_name(err));
+    uint16_t cnt = n;
+    if (esp_wifi_scan_get_ap_records(&cnt, rec) != ESP_OK) {
+        ESP_LOGE(TAG, "Scan: get_ap_records failed");
         free(rec);
+        if (out_count) {
+            *out_count = 0;
+        }
+        return NULL;
+    }
+    if (out_count) {
+        *out_count = cnt;
+    }
+    return rec;
+}
+
+static void log_scan_results_buf(const wifi_ap_record_t *rec, uint16_t count)
+{
+    if (!rec || count == 0) {
+        ESP_LOGW(TAG, "Scan: 0 APs (check antenna / band — office may be 5 GHz only)");
         return;
     }
-
     ESP_LOGI(TAG, "Scan: %u AP(s) visible:", (unsigned)count);
     for (uint16_t i = 0; i < count; i++) {
         const wifi_ap_record_t *ap = &rec[i];
@@ -344,7 +380,69 @@ static void log_scan_results(void)
         ESP_LOGI(TAG, "  [%2u] %-32s  RSSI %4d  ch %3u  %s",
                  (unsigned)(i + 1), ssid, ap->rssi, ap->primary, authmode_str(ap->authmode));
     }
-    free(rec);
+}
+
+static bool scan_contains_ssid_buf(const wifi_ap_record_t *rec, uint16_t cnt, const char *ssid)
+{
+    if (!rec || cnt == 0 || !ssid || ssid[0] == '\0') {
+        return false;
+    }
+    for (uint16_t i = 0; i < cnt; i++) {
+        if (strcmp((char *)rec[i].ssid, ssid) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * If current STA SSID does not appear in scan, switch STA + s_profile_* to compile-time defaults
+ * for this run only — does not write NVS, so LIST/GET wifi_ssid still show preferred (e.g. CREACELL)
+ * and the next cold boot tries NVS again when that AP is back.
+ * @param rec,cnt  Same snapshot from single scan_results_take() (IDF clears list after read).
+ */
+static void maybe_fallback_to_default_wifi_after_scan_buf(const wifi_ap_record_t *rec, uint16_t count)
+{
+    if (WIFI_DEFAULT_SSID[0] == '\0' || !rec || count == 0) {
+        return;
+    }
+
+    wifi_config_t wc = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &wc) != ESP_OK) {
+        return;
+    }
+    const char *cur = (const char *)wc.sta.ssid;
+    if (cur[0] == '\0') {
+        return;
+    }
+    if (scan_contains_ssid_buf(rec, count, cur)) {
+        return;
+    }
+    if (strcmp(cur, WIFI_DEFAULT_SSID) == 0) {
+        ESP_LOGW(TAG, "Default SSID \"%s\" not in scan — will not connect until it appears", cur);
+        return;
+    }
+
+    ESP_LOGW(TAG, "SSID \"%s\" not in scan — falling back to default \"%s\"", cur, WIFI_DEFAULT_SSID);
+
+    memset(&wc, 0, sizeof(wc));
+    strncpy((char *)wc.sta.ssid, WIFI_DEFAULT_SSID, sizeof(wc.sta.ssid) - 1);
+    strncpy((char *)wc.sta.password, WIFI_DEFAULT_PASS, sizeof(wc.sta.password) - 1);
+    wc.sta.bssid_set = false;
+    memset(wc.sta.bssid, 0, sizeof(wc.sta.bssid));
+    wc.sta.channel = 0;
+    sta_apply_connect_policy(&wc);
+
+    if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK) {
+        ESP_LOGW(TAG, "Fallback default: esp_wifi_set_config failed");
+        return;
+    }
+    ESP_LOGI(TAG, "Runtime Wi‑Fi fallback to \"%s\" — NVS wifi_ssid/wifi_pass unchanged (preferred retried next boot)",
+             WIFI_DEFAULT_SSID);
+
+    strncpy(s_profile_ssid, WIFI_DEFAULT_SSID, sizeof(s_profile_ssid) - 1);
+    s_profile_ssid[sizeof(s_profile_ssid) - 1] = '\0';
+    s_profile_open = (WIFI_DEFAULT_PASS[0] == '\0');
 }
 
 /* ── WiFi status LED task ───────────────────────────────────────────── */
@@ -385,10 +483,25 @@ static void wifi_status_led_task(void *arg)
 static void reconnect_timer_cb(void *arg)
 {
     (void)arg;
-    if (s_state == WIFI_MGR_STATE_DISCONNECTED) {
-        ESP_LOGI(TAG, "Reconnect attempt...");
-        esp_wifi_connect();
+    if (s_state != WIFI_MGR_STATE_DISCONNECTED) {
+        return;
     }
+    if (s_reconnect_scan_first) {
+        s_reconnect_scan_first = false;
+        s_scan_before_connect_done = false;
+        wifi_scan_config_t sc = default_scan_config();
+        esp_err_t se = esp_wifi_scan_start(&sc, false);
+        if (se != ESP_OK) {
+            ESP_LOGW(TAG, "Reconnect scan failed (%s) — direct connect", esp_err_to_name(se));
+            s_scan_before_connect_done = true;
+            esp_wifi_connect();
+        } else {
+            ESP_LOGI(TAG, "Reconnect: scanning before connect…");
+        }
+        return;
+    }
+    ESP_LOGI(TAG, "Reconnect attempt...");
+    esp_wifi_connect();
 }
 
 /* ── unified event handler ──────────────────────────────────────────── */
@@ -418,7 +531,11 @@ static void wifi_event_handler(void *arg,
                         s_wps_session_active = true;
                         ESP_LOGI(TAG, "WPS PBC active (%ds) — press WPS on router now",
                                  WIFI_WPS_TIMEOUT_S);
-                        /* Timeout is enforced inside esp_wifi_wps_start() (IDF ≥5.3, arg = ms). */
+                        if (s_wps_cap_timer != NULL) {
+                            (void)esp_timer_start_once(
+                                    s_wps_cap_timer,
+                                    (uint64_t)WIFI_WPS_TIMEOUT_S * 1000000ULL);
+                        }
                         break;
                     }
                 }
@@ -463,8 +580,35 @@ static void wifi_event_handler(void *arg,
         case WIFI_EVENT_SCAN_DONE:
             if (!s_scan_before_connect_done) {
                 s_scan_before_connect_done = true;
-                log_scan_results();
-                (void)open_pick_bssid_from_scan_results();
+                uint16_t ap_count = 0;
+                wifi_ap_record_t *ap_list = scan_results_take(&ap_count);
+                if (ap_list == NULL || ap_count == 0) {
+                    ESP_LOGW(TAG, "Scan: 0 APs (check antenna / band — office may be 5 GHz only)");
+                    if (ap_list) {
+                        free(ap_list);
+                    }
+                    s_state = WIFI_MGR_STATE_DISCONNECTED;
+                    s_reconnect_scan_first = true;
+                    if (s_reconnect_timer) {
+                        esp_timer_start_once(s_reconnect_timer, 5ULL * 1000000ULL);
+                    }
+                    break;
+                }
+                log_scan_results_buf(ap_list, ap_count);
+                maybe_fallback_to_default_wifi_after_scan_buf(ap_list, ap_count);
+                (void)open_pick_bssid_from_scan_buf(ap_list, ap_count);
+                if (!scan_contains_ssid_buf(ap_list, ap_count, s_profile_ssid)) {
+                    ESP_LOGW(TAG, "SSID \"%s\" not in scan — skip connect; rescan in 5 s",
+                             s_profile_ssid);
+                    free(ap_list);
+                    s_state = WIFI_MGR_STATE_DISCONNECTED;
+                    s_reconnect_scan_first = true;
+                    if (s_reconnect_timer) {
+                        esp_timer_start_once(s_reconnect_timer, 5ULL * 1000000ULL);
+                    }
+                    break;
+                }
+                free(ap_list);
                 ESP_LOGI(TAG, "Connecting to configured SSID…");
                 esp_wifi_connect();
             }
@@ -493,6 +637,9 @@ static void wifi_event_handler(void *arg,
                 }
                 if (d->reason == WIFI_REASON_NO_AP_FOUND) {
                     ESP_LOGW(TAG, "  → SSID not seen; confirm 2.4 GHz, exact name, and scan list above.");
+                    s_reconnect_scan_first = true;
+                } else if (d->reason == WIFI_REASON_BEACON_TIMEOUT) {
+                    s_reconnect_scan_first = true;
                 } else if (d->reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY ||
                            d->reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD ||
                            d->reason == WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD) {
@@ -517,11 +664,37 @@ static void wifi_event_handler(void *arg,
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&ev->ip_info.ip));
         s_state = WIFI_MGR_STATE_CONNECTED;
-        ESP_LOGI(TAG, "Connected – IP: %s", s_ip_str);
+
+        wifi_config_t wc = {0};
+        char ssid_disp[sizeof(wc.sta.ssid) + 1] = {0};
+        if (esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK) {
+            strncpy(ssid_disp, (char *)wc.sta.ssid, sizeof(ssid_disp) - 1);
+        }
+        if (ssid_disp[0] == '\0') {
+            strncpy(ssid_disp, s_profile_ssid, sizeof(ssid_disp) - 1);
+        }
+        if (wc.sta.bssid_set) {
+            ESP_LOGI(TAG,
+                     "Connected — SSID \"%s\"  BSSID %02x:%02x:%02x:%02x:%02x:%02x  IP %s  GW " IPSTR
+                     "  mask " IPSTR,
+                     ssid_disp[0] ? ssid_disp : "(unknown)",
+                     wc.sta.bssid[0], wc.sta.bssid[1], wc.sta.bssid[2], wc.sta.bssid[3], wc.sta.bssid[4],
+                     wc.sta.bssid[5], s_ip_str, IP2STR(&ev->ip_info.gw), IP2STR(&ev->ip_info.netmask));
+        } else {
+            ESP_LOGI(TAG,
+                     "Connected — SSID \"%s\"  IP %s  GW " IPSTR "  mask " IPSTR,
+                     ssid_disp[0] ? ssid_disp : "(unknown)", s_ip_str, IP2STR(&ev->ip_info.gw),
+                     IP2STR(&ev->ip_info.netmask));
+        }
     }
 }
 
 /* ── public API ─────────────────────────────────────────────────────── */
+
+bool wifi_manager_wps_boot_pending(void)
+{
+    return s_wps_boot_requested;
+}
 
 bool wifi_manager_init(void)
 {
@@ -593,6 +766,15 @@ bool wifi_manager_init(void)
         .name     = "wifi_reconnect",
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_reconnect_timer));
+
+    esp_timer_create_args_t wps_cap_args = {
+        .callback = wps_cap_timer_cb,
+        .name     = "wps_cap",
+    };
+    if (esp_timer_create(&wps_cap_args, &s_wps_cap_timer) != ESP_OK) {
+        s_wps_cap_timer = NULL;
+        ESP_LOGW(TAG, "WPS cap timer not created — WPS may run up to 120s (IDF default)");
+    }
 
     /* ── WiFi config ── */
     wifi_config_t wifi_cfg = {0};

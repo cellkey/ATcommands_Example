@@ -1273,6 +1273,7 @@ void app_main(void) {
     esp_log_level_set("gpio", ESP_LOG_WARN);         /* suppress GPIO[xx] info prints */
     esp_log_level_set("CFG_UART", ESP_LOG_WARN);     /* config shell prints its own banner/prompt */
     esp_log_level_set("MODEM_EXAMPLE", ESP_LOG_WARN);/* hide demo helper info logs */
+    esp_log_level_set("wifi", ESP_LOG_WARN);         /* suppress ch/BW/state spam; keep W warnings */
 
     /* NVS: init first so status_reg can gate modem GPIO and tasks below. */
     esp_err_t nvs = nvs_flash_init();
@@ -1418,6 +1419,12 @@ void app_main(void) {
         ESP_LOGI(TAG, "System ready – modem slave + WiFi server path");
     } else {
         ESP_LOGI(TAG, "System ready – modem full (cellular TCP)");
+    }
+
+    if (wifi_on && wifi_manager_wps_boot_pending()) {
+        ESP_LOGI(TAG,
+                 "WiFi WPS: unit waiting for router — press WPS/PBC on the access point (timeout %d s)",
+                 WIFI_WPS_TIMEOUT_S);
     }
 
     vTaskDelay(pdMS_TO_TICKS(APPMODEM_START_DELAY_MS));
