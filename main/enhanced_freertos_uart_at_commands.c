@@ -26,6 +26,7 @@
 #include "at_command_examples.h"
 #include "wifi_manager.h"
 #include "wifi_tcp_client.h"
+#include "unit_ready.h"
 
 // Forward declaration for integration demo
 extern void start_integration_demo(void);
@@ -491,9 +492,7 @@ static void uart_rx_task(void *arg) {
     }
 
     uint8_t data[64];
-    int rx_idle_count = 0;
-    static bool unit_ready_logged = false;
-    
+
     ESP_LOGI(TAG, "UART RX Task started - monitoring GPIO%d for data", UART_RX_PIN);
     
     while (1) {
@@ -501,7 +500,6 @@ static void uart_rx_task(void *arg) {
         // Wait for RX data, up to 100ms
         int len = uart_read_bytes(UART_NUM, data, sizeof(data), pdMS_TO_TICKS(100));
         if (len > 0) {
-            rx_idle_count = 0; // Reset idle counter
             if (fota_session_active()) {
                 ESP_LOGD(TAG, "UART RX: Got %d bytes", len);
             } else {
@@ -526,21 +524,8 @@ static void uart_rx_task(void *arg) {
             
             // Process complete lines
             process_rx_buffer();
-        } else {
-            // No data received - count idle cycles
-            rx_idle_count++;
-            if (rx_idle_count == 100) {  /* First 10 s with no UART data */
-                /* Avoid printing "Unit Ready.." during modem init/bring-up; it confuses timing logs.
-                 * Only print once when the system is actually connected and idle.
-                 */
-                if (!unit_ready_logged && modem_connected && !modem_init_active) {
-                    ESP_LOGI(TAG, "\033[1;32mUnit Ready..\033[0m");
-                    unit_ready_logged = true;
-                }
-                rx_idle_count = 0;
-            }
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to prevent overwhelming
     }
 }
@@ -986,12 +971,16 @@ static void modem_init_task(void *arg) {
              * so after this power-up delay we go straight into the normal init.
              */
 
-            // Initialize modem (A7670E sequence: phase 1 + phase 2 per reference log)
+            /* Initialize modem (A7670E sequence). Full mode then opens cellular TCP; slave mode uses WiFi for server. */
             int init_res = run_a7670e_init();
             if (init_res < 0) {
                 ESP_LOGE(TAG, "Modem init (run_a7670e_init) failed on attempt %d/%d", attempt, max_attempts_per_cycle);
+            } else if (nvs_config_connectivity_mode() == NVS_CONN_MODEM_SLAVE_WIFI) {
+                connect_ok = true;
+                ESP_LOGI(TAG, "Modem slave: RF/init OK — server path is WiFi (attempt %d/%d)",
+                         attempt, max_attempts_per_cycle);
+                break;
             } else {
-                /* Connect (CIPOPEN + GET + 200 OK) in same task so it always runs before task ends */
                 connect_ok = (run_a7670e_connect_and_register() == 0);
                 if (connect_ok) {
                     ESP_LOGI(TAG, "Modem connect OK on attempt %d/%d", attempt, max_attempts_per_cycle);
@@ -1028,8 +1017,14 @@ static void modem_init_task(void *arg) {
     }
 
     if (connect_ok) {
-        server_keepalive_task_start();
-        modem_connected = true;
+        if (nvs_config_connectivity_mode() == NVS_CONN_MODEM_SLAVE_WIFI) {
+            if (server_keepalive_ring_worker_start()) {
+                modem_connected = true;
+            }
+        } else {
+            server_keepalive_task_start();
+            modem_connected = true;
+        }
     }
     ESP_LOGI(TAG, "Modem initialization task completed - task will now terminate");
     
@@ -1040,8 +1035,9 @@ static void modem_init_task(void *arg) {
         xSemaphoreGive(init_control_mutex);
     }
     
-    if (connect_ok) {
-        ESP_LOGI(TAG, "\033[1;32mUnit Ready..\033[0m");
+    /* Unit Ready after server path: WiFi TCP does it (200 OK). Pure modem uses this. */
+    if (connect_ok && nvs_config_connectivity_mode() == NVS_CONN_MODEM_FULL) {
+        unit_ready_try_announce_once();
     }
     // Delete this task
     vTaskDelete(NULL);
@@ -1246,8 +1242,30 @@ bool is_modem_init_active(void) {
     return active;
 }
 
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT_PIN_EN";
+    case ESP_RST_SW:        return "SW_esp_restart";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT_OTHER";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////////
 void app_main(void) {
+
+    /* ROM line "rst:0x1" is not always literal wall-power loss; compare to this. */
+    esp_reset_reason_t rr = esp_reset_reason();
+    ESP_LOGW(TAG, "CPU reset reason: %s (%d) — if BROWNOUT/EXT_PIN_EN, check supply & EN wiring",
+             reset_reason_str(rr), (int)rr);
 
     ESP_LOGI(TAG, "app_main()-EG unit - ESP32 WROOM 32E - Modem A7670E");
 
@@ -1265,16 +1283,16 @@ void app_main(void) {
     nvs_config_init();
     nvs_config_ensure_unit_id_default(A7670E_UNIT_ID);
 
-    /* status_reg bit 4 (0x0010) = modem ENABLED.
-     * Default 0x0000 → WiFi-only (safe when modem hardware not assembled).
-     * Enable modem:    SET status_reg=0x0010  then  REBOOT.
-     * Disable modem:   SET status_reg=0x0000  then  REBOOT.            */
-    #define STATUS_ENABLE_MODEM    0x0010
-    uint16_t early_sr       = nvs_config_get_status_reg(0x0000);
-    bool     modem_disabled = (early_sr & STATUS_ENABLE_MODEM) == 0;   /* bit CLEAR = no modem */
+    uint16_t early_sr = nvs_config_get_status_reg(0x0000);
+    nvs_config_set_connectivity_mode_from_reg(early_sr);
+    nvs_connectivity_mode_t conn = nvs_config_connectivity_mode();
 
-    if (modem_disabled) {
-        ESP_LOGW(TAG, "*** WiFi-only mode (status_reg=0x%04X, bit4 clear) – modem UART/GPIO/tasks skipped ***", early_sr);
+    bool modem_on = (conn == NVS_CONN_MODEM_FULL || conn == NVS_CONN_MODEM_SLAVE_WIFI);
+    bool wifi_on  = (conn == NVS_CONN_WIFI_ONLY || conn == NVS_CONN_MODEM_SLAVE_WIFI);
+    bool modem_disabled = !modem_on;
+
+    if (!modem_on) {
+        ESP_LOGI(TAG, "*** Modem path off (status_reg=0x%04X, WiFi-only) — UART/GPIO/modem tasks skipped ***", early_sr);
     } else {
         /* Keep modem supply OFF until UART/firmware are ready. GPIO12 active-low: HIGH = off. */
         gpio_reset_pin(A7670E_MODEM_PWR_GPIO);
@@ -1282,12 +1300,7 @@ void app_main(void) {
         gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);
     }
 
-    /* WiFi: only when modem is disabled (bit4 clear = WiFi-only mode).
-     * When modem is active WiFi is fully skipped — site-specific credentials
-     * won't be configured on modem deployments.
-     * Future: STATUS_MODEM_SLAVE (0x0030) will re-enable WiFi alongside modem
-     *         for voice/ring-only modem + WiFi data path. */
-    if (modem_disabled) {
+    if (wifi_on) {
         wifi_manager_init();
         wifi_tcp_client_start();
     }
@@ -1295,11 +1308,10 @@ void app_main(void) {
     /* After OTA: confirm image so bootloader rollback does not revert on next reset. */
     fota_mark_current_app_valid_if_needed();
 
-    /* status_reg bit map: 0-1=KEEPOPEN relay, 4=disable modem (WiFi-only), higher bits=future use. */
-    ESP_LOGI(TAG, "Status register: 0x%04X  modem=%s  wifi=%s",
-             early_sr,
-             modem_disabled                   ? "OFF" : "ON",
-             wifi_manager_is_connected()      ? "connected" : "starting");
+    ESP_LOGI(TAG, "status_reg=0x%04X  mode=%d  modem=%s  wifi=%s",
+             early_sr, (int)conn,
+             modem_on ? (conn == NVS_CONN_MODEM_SLAVE_WIFI ? "slave" : "full") : "OFF",
+             wifi_on ? (wifi_manager_is_connected() ? "connected" : "starting") : "OFF");
 
     /* 1) Relay first (shared by modem OPEN, BLE app, and CHECK_USER flow). */
     if (relay_control_init() != ESP_OK || relay_control_start() != ESP_OK) {
@@ -1351,6 +1363,11 @@ void app_main(void) {
                  (int)WATCHDOG_TIMEOUT_SECONDS, modem_disabled ? "wifi tasks" : "uart_rx");
     }
 
+    /* Config shell before modem setup so it still starts if modem mutex/queue creation fails below. */
+    if (!config_uart_start()) {
+        ESP_LOGW(TAG, "Config shell not started (xTaskCreate failed)");
+    }
+
     if (!modem_disabled) {
         /* ── Modem sync objects ─────────────────────────────────────────── */
         at_command_queue   = xQueueCreate(AT_QUEUE_SIZE, sizeof(at_command_t));
@@ -1395,15 +1412,12 @@ void app_main(void) {
     }
     /* Note: modem_init_task is created on-demand via start_modem_init_task() */
 
-    /* Config shell on console (same UART as monitor): SET/GET unit_id and status_reg. */
-    if (!config_uart_start()) {
-        ESP_LOGW(TAG, "Config shell not started (optional)");
-    }
-
     if (modem_disabled) {
         ESP_LOGI(TAG, "System ready – WiFi-only mode (modem disabled)");
+    } else if (conn == NVS_CONN_MODEM_SLAVE_WIFI) {
+        ESP_LOGI(TAG, "System ready – modem slave + WiFi server path");
     } else {
-        ESP_LOGI(TAG, "System ready – modem + WiFi mode");
+        ESP_LOGI(TAG, "System ready – modem full (cellular TCP)");
     }
 
     vTaskDelay(pdMS_TO_TICKS(APPMODEM_START_DELAY_MS));

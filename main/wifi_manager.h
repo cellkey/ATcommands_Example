@@ -9,6 +9,12 @@
  *   SET wifi_pass=MyPassword
  *   REBOOT
  *
+ * WPS (push-button): hold WIFI_WPS_BUTTON_GPIO (default 15, active LOW) at WiFi init so
+ * the pin reads LOW (then ~120 ms debounce). If the switch is open (HIGH), no extra delay.
+ * Then press WPS on
+ * the router within WIFI_WPS_TIMEOUT_S seconds. SSID/password are saved to NVS on success.
+ * If nothing pairs, firmware falls back to normal scan + saved SSID.
+ *
  * Auto-reconnects on disconnect (5-second retry, using esp_timer).
  * Call wifi_manager_init() from app_main after nvs_config_init().
  */
@@ -34,14 +40,31 @@ extern "C" {
 /** Compile-time default credentials — used when NVS keys wifi_ssid / wifi_pass are not set.
  *  NVS always wins if present.  Override at runtime via config shell:
  *    SET wifi_ssid=<name>   SET wifi_pass=<pass>   REBOOT              */
-#define WIFI_DEFAULT_SSID    "Gross_home"  //change to your actual wifi ssid
-#define WIFI_DEFAULT_PASS    "avivaaviva1" //change to your actual wifi password
+//#define WIFI_DEFAULT_SSID    "Gross_home"  //change to your actual wifi ssid
+//#define WIFI_DEFAULT_PASS    "avivaaviva1" //change to your actual wifi password
+#define WIFI_DEFAULT_SSID    "CREACELL"     /* must match beacon case (scan log) */
+#define WIFI_DEFAULT_PASS    "creacell2018" //Creacell Slocal wifi password
 
 /** Status LED GPIO (active-high, GPIO23).
  *  Steady ON          → not connected to local network
  *  Blink 500 / 500 ms → connected to local network (no server yet)
  *  Blink 800 / 200 ms → connected to server (Phase 2)               */
 #define WIFI_STATUS_LED_GPIO  23
+
+/**
+ * WPS at boot (push-button config): hold this tact switch active while releasing reset
+ * (or keep pressed for debounce window at start of WiFi init). Active LOW, internal pull-up.
+ * Same pin as A7670E_LOCAL_BUTTON_GPIO (15) unless you wire a dedicated switch — change if needed.
+ * Set to -1 to disable WPS-at-boot sampling.
+ */
+#ifndef WIFI_WPS_BUTTON_GPIO
+#define WIFI_WPS_BUTTON_GPIO  15
+#endif
+
+/** Router WPS window; after this, fall back to normal scan + saved SSID. */
+#ifndef WIFI_WPS_TIMEOUT_S
+#define WIFI_WPS_TIMEOUT_S    120
+#endif
 
 /** Connection state visible to the rest of the application. */
 typedef enum {

@@ -17,9 +17,22 @@ CONFIG_BT_SMP_ENABLE=y
 CONFIG_BT_CTRL_BLE_MAX_ACT=10
 CONFIG_BT_CTRL_BLE_STATIC_ACL_TX_BUF_NB=0
 
+# Match partitions.csv (4MB dual OTA). Use 2MB only if your module has 2MB flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
 # OTA: custom dual-slot table (partitions.csv). Rebuild bootloader after change: idf.py fullclean && idf.py build
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_APP_ROLLBACK_ENABLE=y
+
+# WPS (Wi‑Fi Protected Setup) — boot-time PBC pairing in wifi_manager when tact held at reset.
+CONFIG_ESP_WIFI_WPS=y
+
+# Brownout detector (ESP32): SEL_0 = lowest trip voltage (~2.43 V), most tolerant default.
+# SEL_1..SEL_7 trip at higher voltages — more sensitive, usually more resets if the rail dips.
+# To change: idf.py menuconfig → Component config → ESP System settings → Brownout Detector.
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_0=y
+# Diagnostic only (not production): idf.py menuconfig → disable Brownout Detector to see if resets stop.

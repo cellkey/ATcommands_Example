@@ -41,6 +41,12 @@ bool wifi_tcp_client_start(void);
  */
 void wifi_tcp_client_stop(void);
 
+/**
+ * @brief Queue CHECK_USER:<caller> on the WiFi server TCP socket (modem-slave mode).
+ *        Safe from any task; WiFi TCP task drains the queue when connected.
+ */
+void wifi_tcp_request_check_user(const char *caller_id);
+
 #ifdef __cplusplus
 }
 #endif

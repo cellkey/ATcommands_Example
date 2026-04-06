@@ -26,12 +26,21 @@ extern "C" {
 /** TCP connection id used for CIPSEND (match A7670E link 1). */
 #define SERVER_TCP_LINK_ID        1
 
+/** Max chars for caller ID (+CLCC → CHECK_USER), including null. */
+#define SERVER_RING_CALLER_MAX    32
+
 /**
  * @brief Start the keepalive task. Call after modem init + connect (e.g. after "In main loop..ready").
  *        Task sends KA every SERVER_KA_INTERVAL_SEC and will later react to ACK/commands.
  * @return true if task was created, false on failure.
  */
 bool server_keepalive_task_start(void);
+
+/**
+ * @brief Lightweight task for modem-slave + WiFi mode: on ring, AT+CHUP then CHECK_USER via WiFi.
+ *        Do not use together with server_keepalive_task_start().
+ */
+bool server_keepalive_ring_worker_start(void);
 
 /**
  * @brief Stop the keepalive task (e.g. on disconnect).

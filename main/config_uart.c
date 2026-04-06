@@ -24,6 +24,12 @@ static const char *TAG = "CFG_UART";
 #define CONFIG_LINE_BUF_SIZE  256
 #define CONFIG_TASK_STACK    4096
 #define CONFIG_READ_DELAY_MS 20   /* yield often so watchdog is fed */
+/** LIST: delay + temporarily raise log threshold for noisy tags so monitor stays readable. */
+#define CFG_LIST_PAUSE_MS     2500
+#define CFG_LIST_QUIET_COUNT  6
+static const char *const s_list_quiet_tags[CFG_LIST_QUIET_COUNT] = {
+    "wifi", "WIFI_MGR", "WIFI_TCP", "BLE_GATT", "BTDM_INIT", "NVS_CFG",
+};
 
 static void send_line(const char *s) {
     printf("%s\n", s);
@@ -33,18 +39,11 @@ static void send_line(const char *s) {
 static int get_line(char *buf, int size) {
     int fd = fileno(stdin);
     int n = 0;
-    bool prompt_shown = false;
-    
+
     while (n < size - 1) {
         char c;
         ssize_t r = read(fd, &c, 1);
         if (r == 1) {
-            if (!prompt_shown) {
-                printf("\nCFG> ");  // Show prompt when first character arrives
-                fflush(stdout);
-                prompt_shown = true;
-            }
-            
             if (c == '\n' || c == '\r') {
                 buf[n] = '\0';
                 printf("\n");  // Echo newline
@@ -133,6 +132,29 @@ static void list_all(void) {
     send_line(line);
 }
 
+static void list_with_pause_and_quiet_logs(void)
+{
+    esp_log_level_t saved[CFG_LIST_QUIET_COUNT];
+    for (int i = 0; i < CFG_LIST_QUIET_COUNT; i++) {
+        saved[i] = esp_log_level_get(s_list_quiet_tags[i]);
+        esp_log_level_set(s_list_quiet_tags[i], ESP_LOG_ERROR);
+    }
+
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "CFG: LIST — %d ms pause, WiFi/BLE logs hushed; then NVS dump. Next CFG> for SET…",
+             CFG_LIST_PAUSE_MS);
+    send_line(msg);
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(CFG_LIST_PAUSE_MS));
+
+    list_all();
+
+    for (int i = 0; i < CFG_LIST_QUIET_COUNT; i++) {
+        esp_log_level_set(s_list_quiet_tags[i], saved[i]);
+    }
+}
+
 static void config_uart_task(void *arg) {
     (void)arg;
     char line[CONFIG_LINE_BUF_SIZE];
@@ -142,9 +164,13 @@ static void config_uart_task(void *arg) {
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     send_line("=== Config Shell Ready ===");
-    send_line("Commands : SET key=val | GET key | LIST | REBOOT");
+    /* WARN so this line appears even when app_main sets esp_log_level_set("CFG_UART", ESP_LOG_WARN). */
+    ESP_LOGW(TAG, "task cfg_uart running — LIST / SET / GET on this UART (115200)");
+    send_line("Commands : SET key=val | GET key | LIST | REBOOT  (LIST = pause + quiet, then dump)");
     send_line("Keys     : unit_id  fw_ver  status_reg  wifi_ssid  wifi_pass");
-    send_line("Modem on : SET status_reg=0x0010 -> REBOOT  (off/default: SET status_reg=0x0000 -> REBOOT)");
+    send_line("status_reg bits: 0x0001 R1-KEEP  0x0002 R2-KEEP");
+    send_line("  0x0000=modem full (cell TCP) | 0x0010=WiFi only | 0x0020=modem slave+WiFi (CID->server)");
+    send_line("Upgrade: old 0x0000 WiFi-only -> set 0x0010 + REBOOT");
     printf("CFG> ");
     fflush(stdout);
 
@@ -237,7 +263,7 @@ static void config_uart_task(void *arg) {
                 }
             }
         } else if (strcasecmp(line, "LIST") == 0) {
-            list_all();
+            list_with_pause_and_quiet_logs();
         } else if (strcasecmp(line, "REBOOT") == 0) {
             send_line("Rebooting...");
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -259,6 +285,5 @@ bool config_uart_start(void) {
         ESP_LOGW(TAG, "Config shell task create failed");
         return false;
     }
-    ESP_LOGD(TAG, "Config shell on console (same UART as monitor)");
     return true;
 }

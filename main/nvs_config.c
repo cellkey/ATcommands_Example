@@ -14,6 +14,7 @@
 static const char *TAG = "NVS_CFG";
 static nvs_handle_t s_nvs = 0;
 static bool s_init = false;
+static nvs_connectivity_mode_t s_conn_mode = NVS_CONN_MODEM_FULL;
 
 bool nvs_config_init(void) {
     if (s_init) return true;
@@ -125,4 +126,19 @@ uint16_t nvs_config_get_status_reg(uint16_t default_val) {
 
 bool nvs_config_set_status_reg(uint16_t value) {
     return nvs_config_set_blob(NVS_KEY_STATUS_REG, &value, sizeof(value));
+}
+
+void nvs_config_set_connectivity_mode_from_reg(uint16_t sr) {
+    unsigned m = sr & STATUS_CONN_MODE_MASK;
+    if ((m & STATUS_MODEM_SLAVE) != 0) {
+        s_conn_mode = NVS_CONN_MODEM_SLAVE_WIFI;
+    } else if ((m & STATUS_WIFI_ONLY) != 0) {
+        s_conn_mode = NVS_CONN_WIFI_ONLY;
+    } else {
+        s_conn_mode = NVS_CONN_MODEM_FULL;
+    }
+}
+
+nvs_connectivity_mode_t nvs_config_connectivity_mode(void) {
+    return s_conn_mode;
 }

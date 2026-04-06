@@ -27,11 +27,13 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 
 #include "wifi_tcp_client.h"
 #include "wifi_manager.h"
+#include "unit_ready.h"
 #include "nvs_config.h"
 #include "a7670e_config.h"
 #include "relay_control.h"
@@ -55,6 +57,8 @@ static const char    OPENED_ACK[]  = "6\r\nOPENED\r\n";                        /
 static TaskHandle_t  s_task    = NULL;
 static volatile bool s_stop    = false;
 static volatile int  s_sock    = -1;   /* active socket while in KA loop */
+static QueueHandle_t s_cu_q    = NULL; /* CHECK_USER pending (modem-slave + WiFi) */
+static bool          s_wifi_waiting_cu = false;
 
 /* -----------------------------------------------------------------------
  * Line-parser state (used only from wifi_tcp_task — no lock needed).
@@ -96,6 +100,38 @@ static void wifi_sock_send(const void *data, size_t len) {
     }
 }
 
+static void normalize_caller_id_wifi(char *caller) {
+    if (caller == NULL) return;
+    if (strncmp(caller, "+972", 4) != 0) return;
+    size_t len = strnlen(caller, SERVER_RING_CALLER_MAX - 1);
+    if (len <= 4) return;
+    char normalized[SERVER_RING_CALLER_MAX];
+    snprintf(normalized, sizeof(normalized), "0%s", caller + 4);
+    normalized[SERVER_RING_CALLER_MAX - 1] = '\0';
+    strncpy(caller, normalized, SERVER_RING_CALLER_MAX - 1);
+    caller[SERVER_RING_CALLER_MAX - 1] = '\0';
+}
+
+/** Send one queued CHECK_USER when socket up and not awaiting server response. */
+static void try_send_pending_check_user(int sock) {
+    if (s_wifi_waiting_cu || s_cu_q == NULL || sock < 0) {
+        return;
+    }
+    char caller[SERVER_RING_CALLER_MAX];
+    if (xQueueReceive(s_cu_q, caller, 0) != pdTRUE) {
+        return;
+    }
+    normalize_caller_id_wifi(caller);
+    char payload[64];
+    int plen = snprintf(payload, sizeof(payload), "15\r\nCHECK_USER:%s\r\n", caller);
+    if (plen > 0 && plen < (int)sizeof(payload) && send_all(sock, payload, (size_t)plen)) {
+        s_wifi_waiting_cu = true;
+        ESP_LOGI(TAG, "CHECK_USER sent (WiFi) for %s", caller);
+    } else {
+        ESP_LOGW(TAG, "CHECK_USER send failed on WiFi for %s", caller);
+    }
+}
+
 /* -----------------------------------------------------------------------
  * handle_server_line()
  * Mirrors server_handle_incoming_line() (server_keepalive.c) but sends
@@ -117,6 +153,34 @@ static void handle_server_line(const char *line) {
         return;
     }
     s_saw_ka_one = false;   /* any other line resets the two-step state */
+
+    /* ---- CHECK_USER response (modem-slave path, same as modem TCP) ---- */
+    if (s_wifi_waiting_cu) {
+        if (strncmp(line, "APPROVED", 8) == 0) {
+            int approved_id = atoi(line + 8);
+            int relay_num = approved_id / 100;
+            int duration_sec = approved_id % 100;
+            if (relay_num >= 1 && relay_num <= 3 && duration_sec > 0 && duration_sec <= 99) {
+                relay_command_t rcmd = {
+                    .relay_number = (uint8_t)relay_num,
+                    .duration_ms = (uint32_t)duration_sec * 1000U,
+                    .activate = true,
+                };
+                snprintf(rcmd.description, sizeof(rcmd.description), "APPROVED%d WiFi-srv", approved_id);
+                if (relay_execute_command(&rcmd) == ESP_OK) {
+                    ESP_LOGI(TAG, "APPROVED%d → relay %d (%ds)", approved_id, relay_num, duration_sec);
+                }
+            }
+            wifi_sock_send(OPENED_ACK, sizeof(OPENED_ACK) - 1);
+            s_wifi_waiting_cu = false;
+            return;
+        }
+        if (strcmp(line, "REJECT") == 0) {
+            ESP_LOGI(TAG, "CHECK_USER: REJECT (WiFi)");
+            s_wifi_waiting_cu = false;
+            return;
+        }
+    }
 
     /* ---- FOTA ---- */
     if (strcmp(line, "FOTA") == 0) {
@@ -414,12 +478,16 @@ static void wifi_tcp_task(void *arg) {
         }
         ESP_LOGI(TAG, "200 OK — Server Connection Established");
         wifi_manager_set_server_connected(true);
+        unit_ready_try_announce_once();
 
         /* ---- Phase 5: keepalive loop ---- */
         TickType_t last_ka   = xTaskGetTickCount();
         uint32_t   ka_delay  = SERVER_KA_FIRST_DELAY_SEC * 1000U; /* ms */
 
         while (!s_stop && wifi_manager_is_connected()) {
+            (void)ulTaskNotifyTake(pdTRUE, 0);
+            try_send_pending_check_user(sock);
+
             /* Send keepalive when timer fires */
             uint32_t elapsed = (uint32_t)(
                 (xTaskGetTickCount() - last_ka) * portTICK_PERIOD_MS);
@@ -463,10 +531,37 @@ static void wifi_tcp_task(void *arg) {
 /* -----------------------------------------------------------------------
  * Public API
  * --------------------------------------------------------------------- */
+void wifi_tcp_request_check_user(const char *caller_id) {
+    if (caller_id == NULL || caller_id[0] == '\0') {
+        return;
+    }
+    if (s_cu_q == NULL) {
+        ESP_LOGW(TAG, "check_user: queue not ready");
+        return;
+    }
+    char buf[SERVER_RING_CALLER_MAX];
+    strncpy(buf, caller_id, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    if (xQueueSend(s_cu_q, buf, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGW(TAG, "check_user queue full");
+        return;
+    }
+    if (s_task != NULL) {
+        xTaskNotifyGive(s_task);
+    }
+}
+
 bool wifi_tcp_client_start(void) {
     if (s_task != NULL) {
         ESP_LOGW(TAG, "already running");
         return true;
+    }
+    if (s_cu_q == NULL) {
+        s_cu_q = xQueueCreate(4, SERVER_RING_CALLER_MAX);
+        if (s_cu_q == NULL) {
+            ESP_LOGE(TAG, "check_user queue create failed");
+            return false;
+        }
     }
     s_stop = false;
     BaseType_t r = xTaskCreate(wifi_tcp_task, "wifi_tcp",

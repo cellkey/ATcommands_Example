@@ -26,13 +26,34 @@ extern "C" {
 #define NVS_KEY_WIFI_SSID     "wifi_ssid"
 #define NVS_KEY_WIFI_PASS     "wifi_pass"
 
-/* status_reg bit assignments (persisted in NVS):
- *  - Bit 0 (0x0001): Relay 1 kept active via KEEPOPEN[1] / KEEPOPEN[3] (permanent ON until CLOSE).
- *  - Bit 1 (0x0002): Relay 2 kept active via KEEPOPEN[2] (permanent ON until CLOSE).
- *  Higher bits can be used for mode/flags (see app_main).
+/* status_reg (persisted). BLE is always on — not controlled here.
+ *
+ *  Bits 0–1: relay KEEPOPEN (unchanged).
+ *  Bits 4–5: connectivity profile (see nvs_connectivity_mode_t):
+ *    0x0000  Modem full — cellular TCP to server, KA on modem; WiFi off.
+ *    0x0010  WiFi only — no modem UART/tasks; WiFi STA + TCP to server.
+ *    0x0020  Modem slave + WiFi — modem for voice/dial/+CLCC only; server (KA, CHECK_USER, …) on WiFi.
+ *    0x0030  Same as 0x0020 (bit 5 dominates).
+ *
+ *  Upgrade note: older firmware used 0x0000 as WiFi-only. After this change, use 0x0010 for that.
  */
-#define STATUS_KEEP_RELAY1    0x0001
-#define STATUS_KEEP_RELAY2    0x0002
+#define STATUS_KEEP_RELAY1      0x0001
+#define STATUS_KEEP_RELAY2      0x0002
+#define STATUS_WIFI_ONLY        0x0010
+#define STATUS_MODEM_SLAVE      0x0020
+#define STATUS_CONN_MODE_MASK   (STATUS_WIFI_ONLY | STATUS_MODEM_SLAVE)
+
+typedef enum {
+    NVS_CONN_MODEM_FULL = 0,       /**< 0x0000 */
+    NVS_CONN_WIFI_ONLY,            /**< 0x0010 */
+    NVS_CONN_MODEM_SLAVE_WIFI,     /**< 0x0020 (or 0x0030) */
+} nvs_connectivity_mode_t;
+
+/** Call after reading status_reg (e.g. app_main) to cache connectivity profile. */
+void nvs_config_set_connectivity_mode_from_reg(uint16_t status_reg);
+
+/** Cached mode from last nvs_config_set_connectivity_mode_from_reg(); default MODEM_FULL before set. */
+nvs_connectivity_mode_t nvs_config_connectivity_mode(void);
 
 /** Max string length for config values (including null). */
 #define NVS_CONFIG_MAX_LEN    64

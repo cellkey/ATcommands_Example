@@ -17,12 +17,14 @@
 #include "a7670e_sequences.h"
 #include "nvs_config.h"
 #include "fota_modem.h"
+#include "wifi_tcp_client.h"
 
 static const char *TAG = "SRV_KA";
 
 static void fota_modem_debug_log_snapshot(const char *reason);
 
 static TaskHandle_t s_ka_task_handle = NULL;
+static TaskHandle_t s_ring_worker_handle = NULL;
 static volatile bool s_ka_task_running = false;
 /* Sized FOTA: detect long stalls (same remaining count) → likely server/proxy idle timeout before +IPCLOSE. */
 static uint32_t s_fota_stall_last_remain = UINT32_MAX;
@@ -39,10 +41,9 @@ static bool s_ka_retry_pending = false;
 /* Track consecutive KA send (CIPSEND) failures – after 2 in a row we trigger a full modem re-init. */
 static int s_ka_send_fail_count = 0;
 
-/* Ring / CHECK_USER flow: on +CLCC we set pending; task does CHUP + CIPSEND CHECK_USER, then waits for next read. */
-#define RING_CALLER_MAX 32
+/* Ring / CHECK_USER flow: on +CLCC we set pending; KA task (modem TCP) or ring_worker (WiFi path) runs CHUP + CHECK_USER. */
 static volatile bool s_pending_ring = false;
-static char s_pending_ring_caller[RING_CALLER_MAX];
+static char s_pending_ring_caller[SERVER_RING_CALLER_MAX];
 static bool s_waiting_check_user_response = false;
 
 /* +IPCLOSE: 1,1 → server link closed; keepalive task will run reconnect */
@@ -282,14 +283,14 @@ static void normalize_caller_id(char *caller) {
     if (caller == NULL) return;
     if (strncmp(caller, "+972", 4) != 0) return;
 
-    size_t len = strnlen(caller, RING_CALLER_MAX - 1);
+    size_t len = strnlen(caller, SERVER_RING_CALLER_MAX - 1);
     if (len <= 4) return; /* nothing useful after country code */
 
-    char normalized[RING_CALLER_MAX];
+    char normalized[SERVER_RING_CALLER_MAX];
     snprintf(normalized, sizeof(normalized), "0%s", caller + 4);
-    normalized[RING_CALLER_MAX - 1] = '\0';
-    strncpy(caller, normalized, RING_CALLER_MAX - 1);
-    caller[RING_CALLER_MAX - 1] = '\0';
+    normalized[SERVER_RING_CALLER_MAX - 1] = '\0';
+    strncpy(caller, normalized, SERVER_RING_CALLER_MAX - 1);
+    caller[SERVER_RING_CALLER_MAX - 1] = '\0';
 }
 
 /**
@@ -306,12 +307,15 @@ void server_on_ciprxget_urc(int link_id, int param2) {
 
 void server_on_ring(const char *caller_id) {
     if (caller_id == NULL) return;
-    size_t n = strnlen(caller_id, RING_CALLER_MAX - 1);
-    if (n == 0 || n >= RING_CALLER_MAX) return;
+    size_t n = strnlen(caller_id, SERVER_RING_CALLER_MAX - 1);
+    if (n == 0 || n >= SERVER_RING_CALLER_MAX) return;
     memcpy(s_pending_ring_caller, caller_id, n + 1);
     s_pending_ring = true;
     if (s_ka_task_handle != NULL) {
         xTaskNotifyGive(s_ka_task_handle);
+    }
+    if (s_ring_worker_handle != NULL) {
+        xTaskNotifyGive(s_ring_worker_handle);
     }
 }
 
@@ -551,6 +555,27 @@ static void do_read_buffered_data(int link_id) {
     }
 }
 
+/** Modem-slave mode: hang up voice call, queue CHECK_USER on WiFi TCP (no modem server TCP). */
+static void ring_worker_task(void *arg) {
+    (void)arg;
+    ESP_LOGI(TAG, "ring_worker: CHUP + CHECK_USER via WiFi");
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (!s_pending_ring) {
+            continue;
+        }
+        s_pending_ring = false;
+        char caller[SERVER_RING_CALLER_MAX];
+        strncpy(caller, s_pending_ring_caller, sizeof(caller) - 1);
+        caller[sizeof(caller) - 1] = '\0';
+
+        if (send_at_command_ex("AT+CHUP", "OK", 3000, true) != AT_RESULT_SUCCESS) {
+            ESP_LOGW(TAG, "ring_worker: AT+CHUP failed");
+        }
+        wifi_tcp_request_check_user(caller);
+    }
+}
+
 static void server_keepalive_task(void *arg) {
     (void)arg;
     ESP_LOGI(TAG, "Keepalive task started: KA in %d s", SERVER_KA_FIRST_DELAY_SEC);
@@ -615,9 +640,9 @@ static void server_keepalive_task(void *arg) {
         /* Ring: hang up, send CHECK_USER:<number>, then wait for next +CIPRXGET with APPROVED/REJECT */
         if (n > 0 && s_pending_ring) {
             s_pending_ring = false;
-            char caller[RING_CALLER_MAX];
-            strncpy(caller, s_pending_ring_caller, RING_CALLER_MAX - 1);
-            caller[RING_CALLER_MAX - 1] = '\0';
+            char caller[SERVER_RING_CALLER_MAX];
+            strncpy(caller, s_pending_ring_caller, SERVER_RING_CALLER_MAX - 1);
+            caller[SERVER_RING_CALLER_MAX - 1] = '\0';
             normalize_caller_id(caller);
 
             if (send_at_command_ex("AT+CHUP", "OK", 3000, true) != AT_RESULT_SUCCESS) {
@@ -763,6 +788,18 @@ exit_task:
     s_ka_task_handle = NULL;
     ESP_LOGI(TAG, "Keepalive task stopped");
     vTaskDelete(NULL);
+}
+
+bool server_keepalive_ring_worker_start(void) {
+    if (s_ring_worker_handle != NULL) {
+        return true;
+    }
+    BaseType_t ok = xTaskCreate(ring_worker_task, "ring_wk", 4096, NULL, 6, &s_ring_worker_handle);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create ring_worker task");
+        return false;
+    }
+    return true;
 }
 
 bool server_keepalive_task_start(void) {

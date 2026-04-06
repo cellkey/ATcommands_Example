@@ -315,7 +315,6 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             break;
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
             ESP_LOGI(TAG, "Advertising started");
-            ESP_LOGI(TAG, "\033[1;32mUnit Ready..\033[0m");
             break;
         default:
             break;
