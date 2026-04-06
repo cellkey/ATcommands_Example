@@ -37,8 +37,17 @@ venv/
 BU_12032026/
 MD_files/
 
-# Backup folders (if you want to exclude them)
-# Backup/
+# Scratch / work-in-progress C files generated outside the main build
+FOTA_ATMEGA644-Cursor.c
+
+# Office / spreadsheet docs (Commands_list.xlsx etc.) — keep in backup, not git
+*.xlsx
+*.xls
+*.docx
+*.doc
+
+# Cursor IDE project-level cache (machine-specific)
+.cursorignore
 
 # Dependencies and packages
 dependencies/

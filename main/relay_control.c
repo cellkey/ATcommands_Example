@@ -255,7 +255,7 @@ static void relay_task(void *arg)
     while (relay_task_running) {
         if (xQueueReceive(relay_queue, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (!relay_task_running) break;
-            ESP_LOGI(TAG, "Processing: %s", cmd.description);
+            ESP_LOGI(TAG, "Processing Command: %s", cmd.description);
 
             if (cmd.activate) {
                 if (cmd.relay_number == 3) {

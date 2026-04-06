@@ -36,3 +36,6 @@ CONFIG_ESP_WIFI_WPS=y
 CONFIG_ESP_BROWNOUT_DET=y
 CONFIG_ESP_BROWNOUT_DET_LVL_SEL_0=y
 # Diagnostic only (not production): idf.py menuconfig → disable Brownout Detector to see if resets stop.
+
+# Explicit flash size string (tooling); 4MB also set above with CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"

@@ -27,6 +27,19 @@
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
 
+/* ---- WiFi provisioning via BLE ----------------------------------------
+ * Set BLE_SET_WIFI to 1 to enable the {"cmd":"wifi","ssid":...,"pass":...}
+ * command. Set to 0 to compile it out completely (zero overhead).
+ * App sends the JSON with the normal encrypted_data key for authorization.
+ * On success the device replies "WIFI_SET_OK" and reboots after 1 s.
+ * ----------------------------------------------------------------------- */
+#define BLE_SET_WIFI  1
+
+#if BLE_SET_WIFI
+#include "cJSON.h"
+#include "esp_system.h"   /* esp_restart() */
+#endif
+
 static const char *TAG = "BLE_GATT";
 
 /* BLE status LED: blink when not connected, solid ON when BLE connected.
@@ -40,7 +53,11 @@ static const char *TAG = "BLE_GATT";
 #define GATTS_CHAR_UUID_TX  0xFFE2
 #define GATTS_NUM_HANDLE    6
 #define MAX_DATA_LEN        50
-#define MSG_BUF_LEN         64
+#if BLE_SET_WIFI
+#define MSG_BUF_LEN         200  /* WiFi JSON: ssid(32)+pass(64)+overhead ~130 bytes */
+#else
+#define MSG_BUF_LEN          64
+#endif
 #define NOTIFICATION_QUEUE_SIZE 10
 /** Delay before we initiate disconnect after app message (app typically closes in ~2.5s). */
 #define BLE_DISCONNECT_AFTER_MSG_MS  5000
@@ -321,6 +338,16 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     }
 }
 
+#if BLE_SET_WIFI
+/* Delayed reboot: gives BLE stack time to send the WIFI_SET_OK notification
+ * before the device restarts. */
+static void ble_reboot_task(void *arg) {
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+#endif
+
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
     switch (event) {
@@ -363,9 +390,14 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         case ESP_GATTS_WRITE_EVT:
             if (param->write.handle == char1_handle) {
                 int len = param->write.len > MAX_DATA_LEN ? MAX_DATA_LEN : (int)param->write.len;
-                memcpy(received_data, param->write.value, len);
-                memcpy(message_buffer + message_index, received_data, (size_t)len);
-                message_index += len;
+                if (message_index + len > MSG_BUF_LEN - 1) {
+                    len = MSG_BUF_LEN - 1 - message_index; /* prevent overflow */
+                }
+                if (len > 0) {
+                    memcpy(received_data, param->write.value, len);
+                    memcpy(message_buffer + message_index, received_data, (size_t)len);
+                    message_index += len;
+                }
                 for (int i = message_index - len; i < message_index; i++) {
                     if (message_buffer[i] == '#') {
                         message_buffer[i] = '\0';
@@ -373,7 +405,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                         stop_connection_timeout();
                         ESP_LOGI(TAG, "BLE message: %s", message_buffer);
 
-                        char response[80];
+                        char response[MSG_BUF_LEN + 10]; /* must fit "ACK: " + full message_buffer */
                         if (strlen(message_buffer) <= 15) {
                             snprintf(response, sizeof(response), "ACK: %s", message_buffer);
                         } else {
@@ -383,6 +415,38 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
                         if (strstr(message_buffer, encrypted_data) != NULL) {
                             ESP_LOGI(TAG, "Authorized");
+
+#if BLE_SET_WIFI
+                            /* WiFi provisioning: {"e":[...],"cmd":"wifi","ssid":"...","pass":"..."} */
+                            {
+                                cJSON *root = cJSON_Parse(message_buffer);
+                                if (root) {
+                                    cJSON *cmd_j = cJSON_GetObjectItem(root, "cmd");
+                                    if (cmd_j && cJSON_IsString(cmd_j) &&
+                                        strcmp(cmd_j->valuestring, "wifi") == 0) {
+                                        cJSON *ssid_j = cJSON_GetObjectItem(root, "ssid");
+                                        cJSON *pass_j = cJSON_GetObjectItem(root, "pass");
+                                        if (ssid_j && cJSON_IsString(ssid_j) &&
+                                            pass_j && cJSON_IsString(pass_j)) {
+                                            nvs_config_set_string(NVS_KEY_WIFI_SSID, ssid_j->valuestring);
+                                            nvs_config_set_string(NVS_KEY_WIFI_PASS, pass_j->valuestring);
+                                            ESP_LOGI(TAG, "WiFi creds updated via BLE: SSID=%s", ssid_j->valuestring);
+                                            ble_send_notification("WIFI_SET_OK", true);
+                                            xTaskCreate(ble_reboot_task, "ble_reboot", 1024, NULL, 3, NULL);
+                                            cJSON_Delete(root);
+                                            message_index = 0;
+                                            memset(message_buffer, 0, MSG_BUF_LEN);
+                                            break;
+                                        } else {
+                                            ESP_LOGW(TAG, "WiFi cmd: missing ssid or pass field");
+                                            ble_send_notification("WIFI_SET_ERR", true);
+                                        }
+                                    }
+                                    cJSON_Delete(root);
+                                }
+                            }
+#endif /* BLE_SET_WIFI */
+
                             relay_command_t relay_cmd = {0};
                             if (relay_parse_command_from_json(message_buffer, &relay_cmd) == ESP_OK) {
                                 if (relay_execute_command(&relay_cmd) == ESP_OK) {
