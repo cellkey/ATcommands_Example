@@ -124,8 +124,10 @@ static volatile bool s_modem_urc_atready = false;
 static volatile bool s_modem_urc_cpin_ready = false;
 static volatile bool s_modem_urc_sms_done = false;
 
-/* Modem status LED task handle (GPIO15 per a7670e_config.h). */
+/* Modem status LED task handle (GPIO2 per a7670e_config.h). */
 static TaskHandle_t modem_status_led_task_handle = NULL;
+/** When true, GPIO2 follows WiFi link (WiFi-only); when false, follows modem init/conn/FOTA. */
+static bool s_modem_led_wifi_link_mode = false;
 /* Local button task handle (GPIO15 active-low input). */
 static TaskHandle_t local_button_task_handle = NULL;
 
@@ -146,8 +148,8 @@ bool stop_modem_init_task(void);
 bool is_modem_init_active(void);
 
 /**
- * @brief Modem status LED task: solid ON during init; when connected, slow blink (300 / 2300 ms);
- *        during FOTA, fast blink (300 / 300 ms).
+ * @brief Modem status LED on GPIO2: modem path = init/conn/FOTA patterns; WiFi-only = 500/500 no IP,
+ *        150/2000 with IP, solid ON while server command is handled (wifi_manager_link_led_command_busy).
  */
 static void modem_status_led_task(void *arg)
 {
@@ -158,6 +160,26 @@ static void modem_status_led_task(void *arg)
     gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 0); /* OFF */
 
     while (1) {
+        if (s_modem_led_wifi_link_mode) {
+            if (wifi_manager_link_led_command_busy()) {
+                gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 1);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            if (!wifi_manager_is_connected()) {
+                gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 1);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 0);
+                vTaskDelay(pdMS_TO_TICKS(500));
+            } else {
+                gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 1);
+                vTaskDelay(pdMS_TO_TICKS(150));
+                gpio_set_level(A7670E_MODEM_STATUS_LED_GPIO, 0);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+            continue;
+        }
+
         bool init_active = modem_init_active;
         bool connected = modem_connected;
 
@@ -1292,6 +1314,8 @@ void app_main(void) {
     bool wifi_on  = (conn == NVS_CONN_WIFI_ONLY || conn == NVS_CONN_MODEM_SLAVE_WIFI);
     bool modem_disabled = !modem_on;
 
+    s_modem_led_wifi_link_mode = modem_disabled && wifi_on;
+
     if (!modem_on) {
         ESP_LOGI(TAG, "*** Modem path off (status_reg=0x%04X, WiFi-only) — UART/GPIO/modem tasks skipped ***", early_sr);
     } else {
@@ -1405,6 +1429,12 @@ void app_main(void) {
         }
     } else {
         ESP_LOGI(TAG, "WiFi-only: modem queues / UART / tasks not created");
+        if (wifi_on && modem_status_led_task_handle == NULL) {
+            xTaskCreate(modem_status_led_task, "modem_status_led", 2048, NULL, 4,
+                        &modem_status_led_task_handle);
+            // ESP_LOGI(TAG, "GPIO%d link LED task (WiFi-only: 500/500 → 150/2000 → ON on server cmd)",
+            //          A7670E_MODEM_STATUS_LED_GPIO);
+        }
     }
 
     /* Local button: GPIO15 active-low → relay pulse. Not modem-specific; always active. */
