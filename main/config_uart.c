@@ -25,7 +25,7 @@ static const char *TAG = "CFG_UART";
 #define CONFIG_TASK_STACK    4096
 #define CONFIG_READ_DELAY_MS 20   /* yield often so watchdog is fed */
 /** LIST: delay + temporarily raise log threshold for noisy tags so monitor stays readable. */
-#define CFG_LIST_PAUSE_MS     2500
+#define CFG_LIST_PAUSE_MS     2000
 #define CFG_LIST_QUIET_COUNT  6
 static const char *const s_list_quiet_tags[CFG_LIST_QUIET_COUNT] = {
     "wifi", "WIFI_MGR", "WIFI_TCP", "BLE_GATT", "BTDM_INIT", "NVS_CFG",
@@ -166,12 +166,12 @@ static void config_uart_task(void *arg) {
     send_line("=== Config Shell Ready ===");
     /* WARN so this line appears even when app_main sets esp_log_level_set("CFG_UART", ESP_LOG_WARN). */
     ESP_LOGW(TAG, "task cfg_uart running — LIST / SET / GET on this UART (115200)");
-    send_line("Commands : SET key=val | GET key | LIST | REBOOT  (LIST = pause + quiet, then dump)");
-    send_line("Keys     : unit_id  fw_ver  status_reg  wifi_ssid  wifi_pass");
-    send_line("status_reg bits: 0x0001 R1-KEEP  0x0002 R2-KEEP");
+    send_line("NVS Commands   : SET key=val | GET key | LIST | REBOOT  (LIST = pause + quiet, then dump)");
+    send_line("NVS Keys       : unit_id; fw_ver; status_reg; wifi_ssid; wifi_pass");
+    send_line("stat_reg bits  : 0x0001 R1-KEEP  0x0002 R2-KEEP");
     send_line("  0x0000=modem full (cell TCP) | 0x0010=WiFi only | 0x0020=modem slave+WiFi (CID->server)");
-    send_line("Upgrade: old 0x0000 WiFi-only -> set 0x0010 + REBOOT");
-    printf("CFG> ");
+    send_line("Upgrade WIFI   : defaul 0x0000->Modem;  WiFi-only->0x0010 + REBOOT");
+    printf("CFG > ");
     fflush(stdout);
 
     while (1) {

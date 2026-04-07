@@ -133,27 +133,10 @@ static void try_send_pending_check_user(int sock) {
 }
 
 /* -----------------------------------------------------------------------
- * handle_server_line()
- * Mirrors server_handle_incoming_line() (server_keepalive.c) but sends
- * ACKs via wifi_sock_send() instead of AT+CIPSEND.
+ * handle_server_payload_line()
+ * Non-KA server lines: CHECK_USER, OPEN, KEEPOPEN, CLOSE, etc.
  * --------------------------------------------------------------------- */
-static void handle_server_line(const char *line) {
-    if (line == NULL || line[0] == '\0') return;
-
-    ESP_LOGD(TAG, "srv> [%s]", line);
-
-    /* ---- KA ACK: two consecutive lines "1" then "A" ---- */
-    if (!s_saw_ka_one && strcmp(line, "1") == 0) {
-        s_saw_ka_one = true;
-        return;
-    }
-    if (s_saw_ka_one && strcmp(line, "A") == 0) {
-        s_saw_ka_one = false;
-        ESP_LOGI(TAG, "KA ACK received (1/A)");
-        return;
-    }
-    s_saw_ka_one = false;   /* any other line resets the two-step state */
-
+static void handle_server_payload_line(const char *line) {
     /* ---- CHECK_USER response (modem-slave path, same as modem TCP) ---- */
     if (s_wifi_waiting_cu) {
         if (strncmp(line, "APPROVED", 8) == 0) {
@@ -301,6 +284,34 @@ static void handle_server_line(const char *line) {
     }
 
     ESP_LOGI(TAG, "Unhandled server line: [%s]", line);
+}
+
+/* -----------------------------------------------------------------------
+ * handle_server_line()
+ * Mirrors server_handle_incoming_line() (server_keepalive.c) but sends
+ * ACKs via wifi_sock_send() instead of AT+CIPSEND.
+ * KA "1"/"A" does not drive link LED busy; real commands do (GPIO2 solid ON in WiFi-only).
+ * --------------------------------------------------------------------- */
+static void handle_server_line(const char *line) {
+    if (line == NULL || line[0] == '\0') return;
+
+    ESP_LOGD(TAG, "srv> [%s]", line);
+
+    /* ---- KA ACK: two consecutive lines "1" then "A" ---- */
+    if (!s_saw_ka_one && strcmp(line, "1") == 0) {
+        s_saw_ka_one = true;
+        return;
+    }
+    if (s_saw_ka_one && strcmp(line, "A") == 0) {
+        s_saw_ka_one = false;
+        ESP_LOGI(TAG, "KA ACK received (1/A)");
+        return;
+    }
+    s_saw_ka_one = false;   /* any other line resets the two-step state */
+
+    wifi_manager_set_link_led_command_busy(true);
+    handle_server_payload_line(line);
+    wifi_manager_set_link_led_command_busy(false);
 }
 
 /* -----------------------------------------------------------------------

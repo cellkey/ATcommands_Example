@@ -42,6 +42,8 @@ static const char *TAG = "WIFI_MGR";
 /* ── module state ───────────────────────────────────────────────────── */
 static volatile wifi_mgr_state_t s_state           = WIFI_MGR_STATE_IDLE;
 static volatile bool             s_server_connected = false;
+/** WiFi TCP path: true while processing a server command line (GPIO2 link LED solid ON). */
+static volatile bool             s_link_led_cmd_busy   = false;
 static char                      s_ip_str[16]      = {0};   /* "xxx.xxx.xxx.xxx\0" */
 static esp_timer_handle_t        s_reconnect_timer  = NULL;
 /** One-shot: enforce WIFI_WPS_TIMEOUT_S (IDF supplicant ignores esp_wifi_wps_start(ms), uses 120s). */
@@ -821,4 +823,14 @@ void wifi_manager_set_server_connected(bool connected)
 {
     s_server_connected = connected;
     ESP_LOGI(TAG, "Server connection status: %s", connected ? "CONNECTED" : "NOT CONNECTED !");
+}
+
+bool wifi_manager_link_led_command_busy(void)
+{
+    return s_link_led_cmd_busy;
+}
+
+void wifi_manager_set_link_led_command_busy(bool busy)
+{
+    s_link_led_cmd_busy = busy;
 }
