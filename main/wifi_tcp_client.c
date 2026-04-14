@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>      /* isxdigit — HTTP chunked size lines */
 #include <strings.h>    /* strncasecmp */
 #include <errno.h>
 #include <sys/socket.h>
@@ -29,15 +30,17 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "esp_wifi.h"
 
 #include "wifi_tcp_client.h"
 #include "wifi_manager.h"
 #include "unit_ready.h"
 #include "nvs_config.h"
-#include "a7670e_config.h"
+#include "a7670e_config.h"   /* FOTA_URL_DOWNLOAD_TEST_ENABLE */
 #include "relay_control.h"
 #include "server_keepalive.h"   /* SERVER_KA_FIRST_DELAY_SEC, SERVER_KA_INTERVAL_SEC */
+#include "fota_url_download_test.h"
 
 static const char *TAG = "WIFI_TCP";
 
@@ -132,11 +135,37 @@ static void try_send_pending_check_user(int sock) {
     }
 }
 
+/* HTTP/1.1 chunked body: each chunk is "<hex-size>\r\n<payload>\r\n".
+ * Size lines (e.g. "4" before "FOTA", "7" before "OPEN302") must not be
+ * treated as commands — modem path sees the same stream. */
+static bool is_chunk_size_line(const char *line) {
+    if (line == NULL || line[0] == '\0') {
+        return false;
+    }
+    for (const char *p = line; *p != '\0'; p++) {
+        if (*p == ';') {
+            break; /* chunk extensions: "4;name=value" */
+        }
+        if (!isxdigit((unsigned char)*p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* -----------------------------------------------------------------------
  * handle_server_payload_line()
  * Non-KA server lines: CHECK_USER, OPEN, KEEPOPEN, CLOSE, etc.
  * --------------------------------------------------------------------- */
 static void handle_server_payload_line(const char *line) {
+    if (is_chunk_size_line(line)) {
+        /* INFO: default log level hides DEBUG — show framing so it is obvious the server is talking */
+        ESP_LOGI(TAG, "HTTP chunk size (not a command): [%s]", line);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Server payload: [%s]", line);
+
     /* ---- CHECK_USER response (modem-slave path, same as modem TCP) ---- */
     if (s_wifi_waiting_cu) {
         if (strncmp(line, "APPROVED", 8) == 0) {
@@ -150,11 +179,16 @@ static void handle_server_payload_line(const char *line) {
                     .activate = true,
                 };
                 snprintf(rcmd.description, sizeof(rcmd.description), "APPROVED%d WiFi-srv", approved_id);
-                if (relay_execute_command(&rcmd) == ESP_OK) {
+                esp_err_t rre = relay_execute_gated_server_activation(&rcmd);
+                if (rre == ESP_OK) {
                     ESP_LOGI(TAG, "APPROVED%d → relay %d (%ds)", approved_id, relay_num, duration_sec);
+                    wifi_sock_send(OPENED_ACK, sizeof(OPENED_ACK) - 1);
+                } else if (rre == ESP_ERR_INVALID_STATE) {
+                    ESP_LOGW(TAG, "APPROVED%d ignored (digital-input gate, GPIO22 not active)", approved_id);
                 }
+            } else {
+                wifi_sock_send(OPENED_ACK, sizeof(OPENED_ACK) - 1);
             }
-            wifi_sock_send(OPENED_ACK, sizeof(OPENED_ACK) - 1);
             s_wifi_waiting_cu = false;
             return;
         }
@@ -167,8 +201,14 @@ static void handle_server_payload_line(const char *line) {
 
     /* ---- FOTA ---- */
     if (strcmp(line, "FOTA") == 0) {
-        /* WiFi OTA is a future feature; cellular FOTA requires the modem. */
-        ESP_LOGW(TAG, "FOTA invite received — WiFi OTA not yet implemented");
+        if (fota_url_download_test_try_handle_invite()) {
+            return;
+        }
+#if FOTA_URL_DOWNLOAD_TEST_ENABLE
+        ESP_LOGW(TAG, "FOTA: URL test not started (empty FOTA_URL_DOWNLOAD_TEST_URL, or WiFi STA down)");
+#else
+        ESP_LOGW(TAG, "FOTA received — URL download is off (set FOTA_URL_DOWNLOAD_TEST_ENABLE=1 in a7670e_config.h)");
+#endif
         return;
     }
 
@@ -189,11 +229,14 @@ static void handle_server_payload_line(const char *line) {
             };
             snprintf(rcmd.description, sizeof(rcmd.description),
                      "OPEN%d WiFi-srv", cmd_id);
-            if (relay_execute_command(&rcmd) == ESP_OK) {
+            esp_err_t rre = relay_execute_gated_server_activation(&rcmd);
+            if (rre == ESP_OK) {
                 ESP_LOGI(TAG, "OPEN%d → relay %d for %d s", cmd_id, relay_num, dur_sec);
                 wifi_sock_send(OPENED_ACK, sizeof(OPENED_ACK) - 1); /* exclude '\0' */
+            } else if (rre == ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "OPEN%d ignored (digital-input gate, GPIO22 not active)", cmd_id);
             } else {
-                ESP_LOGW(TAG, "OPEN%d: relay_execute_command failed", cmd_id);
+                ESP_LOGW(TAG, "OPEN%d: relay_execute_gated_server_activation failed", cmd_id);
             }
         } else {
             ESP_LOGI(TAG, "OPEN%d: no relay mapping (relay=%d, dur=%d s)",

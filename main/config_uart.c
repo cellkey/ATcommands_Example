@@ -168,8 +168,9 @@ static void config_uart_task(void *arg) {
     ESP_LOGW(TAG, "task cfg_uart running — LIST / SET / GET on this UART (115200)");
     send_line("NVS Commands   : SET key=val | GET key | LIST | REBOOT  (LIST = pause + quiet, then dump)");
     send_line("NVS Keys       : unit_id; fw_ver; status_reg; wifi_ssid; wifi_pass");
-    send_line("stat_reg bits  : 0x0001 R1-KEEP  0x0002 R2-KEEP");
+    send_line("stat_reg bits  : 0x0001 R1-KEEP  0x0002 R2-KEEP  0x0080 gate OPEN+dial APPROVED GPIO22");
     send_line("  0x0000=modem full (cell TCP) | 0x0010=WiFi only | 0x0020=modem slave+WiFi (CID->server)");
+    send_line("  0x0080: OPEN/APPROVED only if GPIO22; hold until input off; KEEPOPEN/CLOSE unchanged (REBOOT)");
     send_line("Upgrade WIFI   : defaul 0x0000->Modem;  WiFi-only->0x0010 + REBOOT");
     printf("CFG > ");
     fflush(stdout);

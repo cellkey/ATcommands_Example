@@ -15,6 +15,8 @@ typedef struct {
     uint8_t relay_number;               // Relay number: 1=relay1, 2=relay2, 3=both relays
     uint32_t duration_ms;               // Duration in milliseconds (0 = toggle permanently, max 15000ms)
     bool activate;                      // true = activate, false = deactivate
+    /** If true (server OPEN/APPROVED under status_reg 0x80): relay OFF when GPIO22 not active; duration ignored. */
+    bool release_when_digital_inactive;
     char description[32];               // Optional description for logging
 } relay_command_t;
 
@@ -51,6 +53,13 @@ esp_err_t relay_control_stop(void);
  * @return ESP_OK on success, error code on failure
  */
 esp_err_t relay_execute_command(const relay_command_t *cmd);
+
+/**
+ * Server OPEN / CHECK_USER APPROVED path: if status_reg bit 0x80 set at boot, requires digital_input_is_active();
+ * then relays stay ON until GPIO22 releases (command duration ignored). Otherwise same as relay_execute_command.
+ * @return ESP_ERR_INVALID_STATE if gate active and input not active
+ */
+esp_err_t relay_execute_gated_server_activation(relay_command_t *cmd);
 
 /**
  * @brief Get status of a specific relay

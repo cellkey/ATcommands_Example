@@ -23,6 +23,7 @@
 #include "at_command_api.h"
 #include "server_keepalive.h"
 #include "fota_modem.h"
+#include "fota_url_download_test.h"
 
 static const char *TAG = "FOTA";
 
@@ -203,6 +204,10 @@ void fota_on_tcp_disconnected(void)
 
 void fota_on_server_invite(void)
 {
+    if (fota_url_download_test_try_handle_invite()) {
+        return;
+    }
+
     if (fota_session_active()) {
         ESP_LOGW(TAG, "invite dup");
         return;

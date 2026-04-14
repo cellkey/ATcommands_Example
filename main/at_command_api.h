@@ -21,6 +21,8 @@ extern "C" {
 // Constants
 /* >= modem CIPRXGET payload (~1500) so one binary segment without \\n is not truncated. */
 #define LINE_BUFFER_SIZE      1600
+/* Long AT lines e.g. AT+HTTPPARA="URL","https://..." */
+#define MAX_AT_COMMAND_LEN    512
 #define UART_NUM_AT           UART_NUM_1           // UART port for AT commands
 
 // AT Command result enumeration

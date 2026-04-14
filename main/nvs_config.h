@@ -35,6 +35,8 @@ extern "C" {
  *    0x0020  Modem slave + WiFi — modem for voice/dial/+CLCC only; server (KA, CHECK_USER, …) on WiFi.
  *    0x0030  Same as 0x0020 (bit 5 dominates).
  *
+ *  Bit 7 (0x0080): relay digital-input gate — see docs/status_reg_relay_digital_gate.md
+ *
  *  Upgrade note: older firmware used 0x0000 as WiFi-only. After this change, use 0x0010 for that.
  */
 #define STATUS_KEEP_RELAY1      0x0001
@@ -42,6 +44,8 @@ extern "C" {
 #define STATUS_WIFI_ONLY        0x0010
 #define STATUS_MODEM_SLAVE      0x0020
 #define STATUS_CONN_MODE_MASK   (STATUS_WIFI_ONLY | STATUS_MODEM_SLAVE)
+/** When set: server OPENxxx + dial APPROVED only if GPIO22 active; hold until input off. KEEPOPEN/CLOSE not gated. */
+#define STATUS_RELAY_GATE_DIGITAL_INPUT  0x0080
 
 typedef enum {
     NVS_CONN_MODEM_FULL = 0,       /**< 0x0000 */
@@ -54,6 +58,12 @@ void nvs_config_set_connectivity_mode_from_reg(uint16_t status_reg);
 
 /** Cached mode from last nvs_config_set_connectivity_mode_from_reg(); default MODEM_FULL before set. */
 nvs_connectivity_mode_t nvs_config_connectivity_mode(void);
+
+/** Call from app_main with same status_reg as connectivity (caches bit 0x0080 until reboot). */
+void nvs_config_set_relay_digital_gate_from_reg(uint16_t status_reg);
+
+/** True if STATUS_RELAY_GATE_DIGITAL_INPUT was set at last nvs_config_set_relay_digital_gate_from_reg(). */
+bool nvs_config_relay_open_requires_digital_input(void);
 
 /** Max string length for config values (including null). */
 #define NVS_CONFIG_MAX_LEN    64

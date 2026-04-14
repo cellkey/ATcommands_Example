@@ -19,6 +19,10 @@
  *   WPS at boot: GPIO must read LOW at init (then short debounce). If idle HIGH, no delay.
  *   Press the router WPS button. On success, SSID/pass saved to NVS; on timeout,
  *   falls back to normal scan + saved credentials.
+ *
+ *   OPEN + empty pass: BSSID pin only if scan shows same SSID on encrypted and OPEN/OWE BSS.
+ *   Otherwise skip pin (multi-AP guest). After associate, WIFI_STA_DHCP_WAIT_S watchdog
+ *   disconnects if DHCP never completes.
  */
 
 #include "wifi_manager.h"    /* WIFI_DEFAULT_SSID / WIFI_DEFAULT_PASS / WIFI_STATUS_LED_GPIO */
@@ -46,6 +50,7 @@ static volatile bool             s_server_connected = false;
 static volatile bool             s_link_led_cmd_busy   = false;
 static char                      s_ip_str[16]      = {0};   /* "xxx.xxx.xxx.xxx\0" */
 static esp_timer_handle_t        s_reconnect_timer  = NULL;
+static esp_timer_handle_t        s_dhcp_wait_timer  = NULL;
 /** One-shot: enforce WIFI_WPS_TIMEOUT_S (IDF supplicant ignores esp_wifi_wps_start(ms), uses 120s). */
 static esp_timer_handle_t        s_wps_cap_timer    = NULL;
 /** After first boot scan completes, reconnects skip scanning unless s_reconnect_scan_first. */
@@ -125,13 +130,60 @@ static void sta_apply_connect_policy(wifi_config_t *wc)
     }
 }
 
+/** True if scan shows same SSID on at least one encrypted BSS and one OPEN/OWE BSS. */
+static bool scan_same_ssid_mixed_enc_and_open_owe(const wifi_ap_record_t *rec, uint16_t cnt,
+                                                   const char *ssid)
+{
+    bool has_enc = false;
+    bool has_open_owe = false;
+    for (uint16_t i = 0; i < cnt; i++) {
+        if (strcmp((char *)rec[i].ssid, ssid) != 0) {
+            continue;
+        }
+        if (rec[i].authmode == WIFI_AUTH_OPEN || rec[i].authmode == WIFI_AUTH_OWE) {
+            has_open_owe = true;
+        } else {
+            has_enc = true;
+        }
+    }
+    return has_enc && has_open_owe;
+}
+
+/** Clear BSSID pin so ALL_CHANNEL_SCAN can try other APs with the same SSID. */
+static void open_clear_sta_bssid_pin(void)
+{
+    wifi_config_t wc = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &wc) != ESP_OK) {
+        return;
+    }
+    if (!wc.sta.bssid_set) {
+        return;
+    }
+    wc.sta.bssid_set = false;
+    memset(wc.sta.bssid, 0, sizeof(wc.sta.bssid));
+    wc.sta.channel = 0;
+    sta_apply_connect_policy(&wc);
+    if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK) {
+        ESP_LOGW(TAG, "clear BSSID pin: esp_wifi_set_config failed");
+    }
+}
+
 /**
- * After a full scan, bind STA to the strongest OPEN or OWE BSS for s_profile_ssid.
- * Mitigates 210 when the same SSID is also broadcast encrypted (empty password vs WPA beacon).
+ * After a full scan, bind STA to the strongest OPEN or OWE BSS for s_profile_ssid **only**
+ * when the same SSID is mixed (encrypted + OPEN/OWE). Otherwise clears any pin — avoids
+ * locking to one guest AP that associates but never runs DHCP.
  */
 static bool open_pick_bssid_from_scan_buf(const wifi_ap_record_t *rec, uint16_t cnt)
 {
     if (!rec || cnt == 0 || !s_profile_open || s_profile_ssid[0] == '\0') {
+        return false;
+    }
+
+    if (!scan_same_ssid_mixed_enc_and_open_owe(rec, cnt, s_profile_ssid)) {
+        open_clear_sta_bssid_pin();
+        ESP_LOGI(TAG,
+                 "Open profile: no encrypted+OPEN clash for \"%s\" in scan — skip BSSID pin",
+                 s_profile_ssid);
         return false;
     }
 
@@ -481,6 +533,22 @@ static void wifi_status_led_task(void *arg)
     }
 }
 
+/* ── DHCP wait: associate without IP (guest AP / wrong BSS) ─────────── */
+static void dhcp_wait_timer_cb(void *arg)
+{
+    (void)arg;
+    if (s_wps_session_active) {
+        return;
+    }
+    if (s_state == WIFI_MGR_STATE_CONNECTED) {
+        return;
+    }
+    ESP_LOGW(TAG,
+             "No IP within %ds after associate — disconnecting to retry (DHCP / multi-AP)",
+             WIFI_STA_DHCP_WAIT_S);
+    esp_wifi_disconnect();
+}
+
 /* ── reconnect timer callback ───────────────────────────────────────── */
 static void reconnect_timer_cb(void *arg)
 {
@@ -619,9 +687,17 @@ static void wifi_event_handler(void *arg,
         case WIFI_EVENT_STA_CONNECTED:
             /* Associated; wait for DHCP (IP_EVENT_STA_GOT_IP). */
             ESP_LOGI(TAG, "STA associated – awaiting IP...");
+            if (!s_wps_session_active && s_dhcp_wait_timer != NULL) {
+                (void)esp_timer_stop(s_dhcp_wait_timer);
+                (void)esp_timer_start_once(
+                        s_dhcp_wait_timer, (uint64_t)WIFI_STA_DHCP_WAIT_S * 1000000ULL);
+            }
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED: {
+            if (s_dhcp_wait_timer != NULL) {
+                (void)esp_timer_stop(s_dhcp_wait_timer);
+            }
             if (s_wps_session_active) {
                 ESP_LOGI(TAG, "STA disconnected during WPS (ignored for reconnect timer)");
                 break;
@@ -663,6 +739,9 @@ static void wifi_event_handler(void *arg,
         }
 
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        if (s_dhcp_wait_timer != NULL) {
+            (void)esp_timer_stop(s_dhcp_wait_timer);
+        }
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&ev->ip_info.ip));
         s_state = WIFI_MGR_STATE_CONNECTED;
@@ -776,6 +855,15 @@ bool wifi_manager_init(void)
     if (esp_timer_create(&wps_cap_args, &s_wps_cap_timer) != ESP_OK) {
         s_wps_cap_timer = NULL;
         ESP_LOGW(TAG, "WPS cap timer not created — WPS may run up to 120s (IDF default)");
+    }
+
+    esp_timer_create_args_t dhcp_wait_args = {
+        .callback = dhcp_wait_timer_cb,
+        .name     = "wifi_dhcp_wait",
+    };
+    if (esp_timer_create(&dhcp_wait_args, &s_dhcp_wait_timer) != ESP_OK) {
+        s_dhcp_wait_timer = NULL;
+        ESP_LOGW(TAG, "DHCP wait timer not created — no post-associate DHCP watchdog");
     }
 
     /* ── WiFi config ── */

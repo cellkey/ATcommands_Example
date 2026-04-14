@@ -15,6 +15,7 @@ static const char *TAG = "NVS_CFG";
 static nvs_handle_t s_nvs = 0;
 static bool s_init = false;
 static nvs_connectivity_mode_t s_conn_mode = NVS_CONN_MODEM_FULL;
+static bool s_relay_gate_digital_input = false;
 
 bool nvs_config_init(void) {
     if (s_init) return true;
@@ -141,4 +142,15 @@ void nvs_config_set_connectivity_mode_from_reg(uint16_t sr) {
 
 nvs_connectivity_mode_t nvs_config_connectivity_mode(void) {
     return s_conn_mode;
+}
+
+void nvs_config_set_relay_digital_gate_from_reg(uint16_t sr) {
+    s_relay_gate_digital_input = (sr & STATUS_RELAY_GATE_DIGITAL_INPUT) != 0;
+    if (s_relay_gate_digital_input) {
+        ESP_LOGI(TAG, "status_reg 0x0080: OPEN + dial APPROVED gated on GPIO22; KEEPOPEN/CLOSE unchanged");
+    }
+}
+
+bool nvs_config_relay_open_requires_digital_input(void) {
+    return s_relay_gate_digital_input;
 }

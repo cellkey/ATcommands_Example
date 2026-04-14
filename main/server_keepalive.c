@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "at_command_api.h"
 #include "server_keepalive.h"
 #include "relay_control.h"
@@ -142,14 +143,16 @@ void server_handle_incoming_line(const char *line) {
                 .activate = true,
             };
             snprintf(rcmd.description, sizeof(rcmd.description), "OPEN%d from server", cmd_id);
-            if (relay_execute_command(&rcmd) == ESP_OK) {
+            esp_err_t rre = relay_execute_gated_server_activation(&rcmd);
+            if (rre == ESP_OK) {
                 ESP_LOGI(TAG, "Server OPEN%d → relay %d (%ds)", cmd_id, relay_num, duration_sec);
-                /* Send OPENED ack back to server for any OPENxyz command. */
                 if (send_at_then_raw_data(SERVER_TCP_LINK_ID, OPENED_ACK_LEN, (const uint8_t *)OPENED_ACK) == AT_RESULT_SUCCESS) {
                     ESP_LOGI(TAG, "OPENED ack sent (for OPEN%d)", cmd_id);
                 } else {
                     ESP_LOGW(TAG, "OPENED ack send failed (for OPEN%d)", cmd_id);
                 }
+            } else if (rre == ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "OPEN%d ignored (digital-input gate, GPIO22 not active)", cmd_id);
             }
         } else {
             ESP_LOGI(TAG, "Server command received: %s (id=%d, no relay mapping)", line, cmd_id);
@@ -492,18 +495,21 @@ static bool do_read_buffered_data_once(int link_id, int *out_unread) {
             if (relay_num >= 1 && relay_num <= 3 && duration_sec > 0 && duration_sec <= 99) {
                 relay_command_t rcmd = {
                     .relay_number = (uint8_t)relay_num,
-                    .duration_ms = (uint32_t)duration_sec * 1000U,                    .activate = true,
+                    .duration_ms = (uint32_t)duration_sec * 1000U,
+                    .activate = true,
                 };
                 snprintf(rcmd.description, sizeof(rcmd.description), "APPROVED%d from server", s_approved_id);
-                if (relay_execute_command(&rcmd) == ESP_OK) {
+                esp_err_t rre = relay_execute_gated_server_activation(&rcmd);
+                if (rre == ESP_OK) {
                     ESP_LOGI(TAG, "APPROVED%d → relay %d (%ds)", s_approved_id, relay_num, duration_sec);
+                    if (send_at_then_raw_data(SERVER_TCP_LINK_ID, OPENED_ACK_LEN, (const uint8_t *)OPENED_ACK) == AT_RESULT_SUCCESS) {
+                        ESP_LOGI(TAG, "OPENED ack sent (id=%d)", s_approved_id);
+                    } else {
+                        ESP_LOGW(TAG, "OPENED ack send failed");
+                    }
+                } else if (rre == ESP_ERR_INVALID_STATE) {
+                    ESP_LOGW(TAG, "APPROVED%d ignored (digital-input gate, GPIO22 not active)", s_approved_id);
                 }
-            }
-            
-            if (send_at_then_raw_data(SERVER_TCP_LINK_ID, OPENED_ACK_LEN, (const uint8_t *)OPENED_ACK) == AT_RESULT_SUCCESS) {
-                ESP_LOGI(TAG, "OPENED ack sent (id=%d)", s_approved_id);
-            } else {
-                ESP_LOGW(TAG, "OPENED ack send failed");
             }
         } else {
             ESP_LOGI(TAG, "Call rejected by server");

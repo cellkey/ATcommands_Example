@@ -44,7 +44,7 @@ extern void start_tcp_examples(void);
 /* RX must hold a full binary line until \\n (OK) — 1024 was too small for 1500 B FOTA chunks. */
 #define RX_BUFFER_SIZE        4096
 /* LINE_BUFFER_SIZE from at_command_api.h */
-#define MAX_AT_COMMAND_LEN    64                   // Maximum AT command length
+/* Long URLs need AT+HTTPPARA="URL","https://..." (FOTA URL test on modem). */
 #define MAX_EXPECTED_RESP_LEN 64                   // Maximum expected response length
 #define AT_TIMEOUT_MS         5000                 // AT command timeout in ms
 #define AT_QUEUE_SIZE         10                   // AT command queue size
@@ -962,7 +962,7 @@ static void modem_init_task(void *arg) {
      */
     gpio_reset_pin(A7670E_MODEM_PWR_GPIO);
     gpio_set_direction(A7670E_MODEM_PWR_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);  /* OFF */
+    gpio_set_level(A7670E_MODEM_PWR_GPIO, 0);  /* OFF */
     vTaskDelay(pdMS_TO_TICKS(MODEM_FORCE_OFF_BEFORE_ON_MS));  /* Ensure a minimum OFF time before first ON */
 
     bool connect_ok = false;
@@ -973,9 +973,9 @@ static void modem_init_task(void *arg) {
     /* Keep trying to bring modem + TCP link up until success. After several full failures, reset CPU (WD-like). */
     while (!connect_ok) {
         for (int attempt = 1; attempt <= max_attempts_per_cycle && !connect_ok; ++attempt) {
-            /* Power ON modem (active-low switch) and wait for power-up. */
-            gpio_set_level(A7670E_MODEM_PWR_GPIO, 0);
-            ESP_LOGI(TAG, "Modem power GPIO %d LOW (ON, attempt %d/%d), waiting %d ms for power-up",
+            /* Power ON modem (active-High switch) and wait for power-up. */
+            gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);
+            ESP_LOGI(TAG, "Modem power GPIO %d HIGH (ON, attempt %d/%d), waiting %d ms for power-up",
                      A7670E_MODEM_PWR_GPIO, attempt, max_attempts_per_cycle, MODEM_POWERUP_WAIT_MS);
             vTaskDelay(pdMS_TO_TICKS(MODEM_POWERUP_WAIT_MS));
 
@@ -1014,8 +1014,8 @@ static void modem_init_task(void *arg) {
             }
 
             /* On failure: power OFF modem and wait a bit before next attempt (full re-init). */
-            gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);
-            ESP_LOGW(TAG, "Modem power GPIO %d set HIGH (OFF) for power cycle", A7670E_MODEM_PWR_GPIO);
+            gpio_set_level(A7670E_MODEM_PWR_GPIO, 0);
+            ESP_LOGW(TAG, "Modem power GPIO %d set LOW (OFF) for power cycle", A7670E_MODEM_PWR_GPIO);
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
 
@@ -1024,7 +1024,7 @@ static void modem_init_task(void *arg) {
         }
 
         /* All attempts in this cycle failed – keep modem powered OFF and try again after a long delay. */
-        gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);
+        gpio_set_level(A7670E_MODEM_PWR_GPIO, 0);
         failed_cycles++;
         ESP_LOGE(TAG, "Modem initialization/connect failed after %d attempts – cycle %d, will retry in %d s",
                  max_attempts_per_cycle, failed_cycles, retry_delay_sec);
@@ -1308,6 +1308,7 @@ void app_main(void) {
 
     uint16_t early_sr = nvs_config_get_status_reg(0x0000);
     nvs_config_set_connectivity_mode_from_reg(early_sr);
+    nvs_config_set_relay_digital_gate_from_reg(early_sr);
     nvs_connectivity_mode_t conn = nvs_config_connectivity_mode();
 
     bool modem_on = (conn == NVS_CONN_MODEM_FULL || conn == NVS_CONN_MODEM_SLAVE_WIFI);
@@ -1322,7 +1323,7 @@ void app_main(void) {
         /* Keep modem supply OFF until UART/firmware are ready. GPIO12 active-low: HIGH = off. */
         gpio_reset_pin(A7670E_MODEM_PWR_GPIO);
         gpio_set_direction(A7670E_MODEM_PWR_GPIO, GPIO_MODE_OUTPUT);
-        gpio_set_level(A7670E_MODEM_PWR_GPIO, 1);
+        gpio_set_level(A7670E_MODEM_PWR_GPIO, 0);
     }
 
     if (wifi_on) {
@@ -1338,7 +1339,12 @@ void app_main(void) {
              modem_on ? (conn == NVS_CONN_MODEM_SLAVE_WIFI ? "slave" : "full") : "OFF",
              wifi_on ? (wifi_manager_is_connected() ? "connected" : "starting") : "OFF");
 
-    /* 1) Relay first (shared by modem OPEN, BLE app, and CHECK_USER flow). */
+    /* Digital input first so GPIO22 is configured before relay (gated OPEN/APPROVED uses digital_input_is_active). */
+    if (!digital_input_alert_task_start()) {
+        ESP_LOGW(TAG, "Digital input alert task not started");
+    }
+
+    /* 1) Relay (shared by modem OPEN, BLE app, and CHECK_USER flow). */
     if (relay_control_init() != ESP_OK || relay_control_start() != ESP_OK) {
         ESP_LOGE(TAG, "Relay control init/start failed");
     }
@@ -1368,11 +1374,6 @@ void app_main(void) {
     /* 2) BLE init (fast); then modem/UART. KA has lowest priority. */
     if (ble_gatt_server_init() != ESP_OK) {
         ESP_LOGE(TAG, "BLE GATT server init failed");
-    }
-
-    /* 3) Digital input monitor: GPIO22 pull-up, active-low; sends ALERT01 after 180s active. */
-    if (!digital_input_alert_task_start()) {
-        ESP_LOGW(TAG, "Digital input alert task not started");
     }
 
     /* Task watchdog: configurable timeout, panic if not fed. Fed by uart_rx_task (modem) and status_led_task (BLE). */

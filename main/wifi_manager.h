@@ -44,8 +44,10 @@ extern "C" {
  *  NVS is not overwritten, so the preferred SSID is tried again on the next boot when visible. */
 //#define WIFI_DEFAULT_SSID    "Gross_home"  //change to your actual wifi ssid
 //#define WIFI_DEFAULT_PASS    "avivaaviva1" //change to your actual wifi password
+
 //#define WIFI_DEFAULT_SSID    "CREACELL"     /* must match beacon case (scan log) */
 //#define WIFI_DEFAULT_PASS    "creacell2018" //Creacell Slocal wifi password
+
 #define WIFI_DEFAULT_SSID    "south up guest"    //south up Slocal wifi password
 #define WIFI_DEFAULT_PASS    ""                 //south up Slocal wifi password
 /** Status LED GPIO (active-high, GPIO23).
@@ -77,6 +79,15 @@ extern "C" {
  */
 #ifndef WIFI_WPS_BOOT_GRACE_MS
 #define WIFI_WPS_BOOT_GRACE_MS  200
+#endif
+
+/**
+ * After WIFI_EVENT_STA_CONNECTED, wait this long for IP_EVENT_STA_GOT_IP.
+ * If DHCP never completes (some guest APs / wrong BSSID), force disconnect so the stack
+ * can retry (scan, other BSS with same SSID, etc.).
+ */
+#ifndef WIFI_STA_DHCP_WAIT_S
+#define WIFI_STA_DHCP_WAIT_S  45
 #endif
 
 /** Connection state visible to the rest of the application. */
@@ -125,6 +136,13 @@ bool wifi_manager_get_ip(char *buf, size_t size);
  *        Call from the WiFi TCP transport layer (Phase 2).
  */
 void wifi_manager_set_server_connected(bool connected);
+
+/**
+ * @brief True while TCP server payload line is being handled (OPEN/CLOSE/etc.) — for link LED solid ON.
+ */
+bool wifi_manager_link_led_command_busy(void);
+
+void wifi_manager_set_link_led_command_busy(bool busy);
 
 #ifdef __cplusplus
 }

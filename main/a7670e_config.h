@@ -44,5 +44,20 @@
 #define A7670E_CREG_MAX_TRIES        20
 #define A7670E_CREG_RETRY_DELAY_SEC  2
 
+/* --------------------------------------------------------------------------
+ * FOTA URL download test (no flash): on server line "FOTA", HTTP GET full URL body, log size + 0xE9.
+ * Does not send START_FOTA, no esp_ota_*.
+ *   - WiFi connected → ESP32 esp_http_client (good TLS).
+ *   - Else modem path (not WiFi-only) → SIMCOM AT+HTTP* on cellular (no WiFi needed).
+ * Set your URL here when testing; leave empty string to use legacy stream FOTA only.
+ *
+ * CRC-32 (zlib / IEEE poly 0xEDB88320): set FOTA_URL_DOWNLOAD_TEST_CRC32_EXPECT to the value of the
+ * exact .bin bytes (e.g. Python: hex(binascii.crc32(open('f.bin','rb').read()) & 0xffffffff)).
+ * Use 0 to skip compare — firmware still logs computed CRC after download.
+ * -------------------------------------------------------------------------- */
+#define FOTA_URL_DOWNLOAD_TEST_ENABLE   1   /* 1 = on FOTA line, HTTP GET FOTA_URL_DOWNLOAD_TEST_URL (WiFi or modem) */
+#define FOTA_URL_DOWNLOAD_TEST_URL      "https://litter.catbox.moe/x6145yml2v2kvhln.bin"
+/* Verified for URL above: 826368 B, first byte 0xE9. Recompute if URL/file changes. 0 = skip CRC compare. */
+#define FOTA_URL_DOWNLOAD_TEST_CRC32_EXPECT  0x23f025b7u
 
 #endif /* A7670E_CONFIG_H */

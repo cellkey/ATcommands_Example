@@ -11,6 +11,8 @@
 /* #define RELAY_ACTIVE_LOW */
 
 #include "relay_control.h"
+#include "nvs_config.h"
+#include "digital_input_alert.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -46,6 +48,7 @@ typedef struct {
     relay_command_t command;
     TickType_t start_time;
     bool is_timed;
+    bool release_when_digital_inactive;
 } active_relay_t;
 
 static QueueHandle_t relay_queue = NULL;
@@ -58,6 +61,7 @@ static void relay_task(void *arg);
 static esp_err_t configure_relay_gpio(void);
 static void set_relay_state(uint8_t relay_number, bool state);
 static void update_relay_timers(void);
+static void release_relays_when_digital_input_inactive(void);
 
 esp_err_t relay_control_init(void)
 {
@@ -123,6 +127,23 @@ esp_err_t relay_control_stop(void)
     return ESP_OK;
 }
 
+esp_err_t relay_execute_gated_server_activation(relay_command_t *cmd)
+{
+    if (!cmd || !cmd->activate) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cmd->release_when_digital_inactive = false;
+    if (nvs_config_relay_open_requires_digital_input()) {
+        if (!digital_input_is_active()) {
+            ESP_LOGW(TAG, "Digital-input gate (0x80): blocked — GPIO%d not active", DIGITAL_INPUT_GPIO);
+            return ESP_ERR_INVALID_STATE;
+        }
+        cmd->duration_ms = 0;
+        cmd->release_when_digital_inactive = true;
+    }
+    return relay_execute_command(cmd);
+}
+
 esp_err_t relay_execute_command(const relay_command_t *cmd)
 {
     if (!cmd || relay_queue == NULL) return ESP_ERR_INVALID_ARG;
@@ -153,6 +174,7 @@ esp_err_t relay_emergency_stop(void)
         relay_status[i].is_active = false;
         relay_status[i].remaining_ms = 0;
         active_relays[i].is_timed = false;
+        active_relays[i].release_when_digital_inactive = false;
     }
     return ESP_OK;
 }
@@ -185,6 +207,7 @@ esp_err_t relay_parse_command_from_json(const char *json_message, relay_command_
     cmd->relay_number = (uint8_t)r;
     cmd->duration_ms = (uint32_t)(d_sec * 1000);
     cmd->activate = true;
+    cmd->release_when_digital_inactive = false;
     snprintf(cmd->description, sizeof(cmd->description), "JSON command");
     cJSON_Delete(json);
     return ESP_OK;
@@ -239,10 +262,29 @@ static void update_relay_timers(void)
             relay_status[i].is_active = false;
             relay_status[i].remaining_ms = 0;
             active_relays[i].is_timed = false;
+            active_relays[i].release_when_digital_inactive = false;
           //  ESP_LOGI(TAG, "Relay %d auto-off after %ums", i + 1, (unsigned)elapsed_ms);
         } else {
             relay_status[i].remaining_ms = active_relays[i].command.duration_ms - elapsed_ms;
         }
+    }
+}
+
+static void release_relays_when_digital_input_inactive(void)
+{
+    if (digital_input_is_active()) {
+        return;
+    }
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        if (!active_relays[i].release_when_digital_inactive || !relay_status[i].is_active) {
+            continue;
+        }
+        set_relay_state((uint8_t)(i + 1), false);
+        relay_status[i].is_active = false;
+        relay_status[i].remaining_ms = 0;
+        active_relays[i].is_timed = false;
+        active_relays[i].release_when_digital_inactive = false;
+        ESP_LOGI(TAG, "Relay %d OFF (digital input inactive, gate 0x80)", i + 1);
     }
 }
 
@@ -264,6 +306,7 @@ static void relay_task(void *arg)
                         set_relay_state(r, true);
                         relay_status[idx].is_active = true;
                         relay_status[idx].total_activations++;
+                        active_relays[idx].release_when_digital_inactive = cmd.release_when_digital_inactive;
                         if (cmd.duration_ms > 0) {
                             active_relays[idx].command = cmd;
                             active_relays[idx].start_time = xTaskGetTickCount();
@@ -280,6 +323,7 @@ static void relay_task(void *arg)
                     set_relay_state(cmd.relay_number, true);
                     relay_status[idx].is_active = true;
                     relay_status[idx].total_activations++;
+                    active_relays[idx].release_when_digital_inactive = cmd.release_when_digital_inactive;
                     if (cmd.duration_ms > 0) {
                         active_relays[idx].command = cmd;
                         active_relays[idx].start_time = xTaskGetTickCount();
@@ -299,6 +343,7 @@ static void relay_task(void *arg)
                         relay_status[r - 1].is_active = false;
                         relay_status[r - 1].remaining_ms = 0;
                         active_relays[r - 1].is_timed = false;
+                        active_relays[r - 1].release_when_digital_inactive = false;
                     }
                     ESP_LOGI(TAG, "Both relays OFF");
                 } else if (cmd.relay_number >= 1 && cmd.relay_number <= MAX_RELAYS) {
@@ -307,11 +352,13 @@ static void relay_task(void *arg)
                     relay_status[idx].is_active = false;
                     relay_status[idx].remaining_ms = 0;
                     active_relays[idx].is_timed = false;
+                    active_relays[idx].release_when_digital_inactive = false;
                     ESP_LOGI(TAG, "Relay %d OFF", cmd.relay_number);
                 }
             }
         }
         update_relay_timers();
+        release_relays_when_digital_input_inactive();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     relay_task_handle = NULL;
